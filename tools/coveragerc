@@ -1,0 +1,3 @@
+[run]
+source = sqlglot, tests
+data_file = /w/work/out/.coverage

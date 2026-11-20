@@ -1,0 +1,7 @@
+# Map-building / mutation-eval environment: the labeling image + requirements.lock
+# + coverage (installed with uv). Not used by the submission image.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir uv==0.9.5 && \
+    uv pip install --system --no-cache -r /tmp/requirements.lock coverage==7.11.0
+ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
