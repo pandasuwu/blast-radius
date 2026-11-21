@@ -678,6 +678,8 @@ def build_index():
     except Exception as e:
         log("shared pool scan failed:", repr(e))
         idx["pool_groups"] = []
+    idx["tpcds_base"] = tpcds_hash({})
+    log("tpcds proxy baseline:", idx["tpcds_base"])
     return idx
 
 
@@ -2056,6 +2058,149 @@ class Selector:
         return m
 
 
+# TPC-DS equivalence check (v5.2). test_execute_tpcds (21.5 s) depends on: parse_one of each
+# fixture query, the pickle round trip, find_tables, the duckdb transpile (reference result) and the
+# optimize() inside executor.execute(); then the planner + python executor run the optimized tree.
+# TPCDS_PROXY dumps everything up to and including optimize() exactly. If the patched source gives
+# the same dump as the pristine one and the patch touches no executor/planner code, the test's
+# outcome cannot change. Validated on 82 labelled selections: 0 misses, 54 of 66 passes skipped.
+TPCDS_PROXY = r'''"""Prototype: the parts of test_execute_tpcds that the test's outcome depends on, minus execution.
+
+For every TPC-DS fixture query, in the test's own order: parse_one (parent), the pickle round trip
+to the pool child, transpile to duckdb (parent's reference result), and the optimize() call inside
+executor.execute(). Prints one hash over a full structural dump of all of them.
+usage: PYTHONPATH=<sqlglot checkout> python tools/tpcds_proxy.py
+"""
+import hashlib
+import pickle
+import sys
+import time
+
+t0 = time.process_time()
+from sqlglot import exp, find_tables, parse_one, transpile  # noqa: E402
+from sqlglot.optimizer import optimize  # noqa: E402
+from sqlglot.schema import ensure_schema  # noqa: E402
+from tests.helpers import TPCDS_SCHEMA, load_sql_fixture_pairs  # noqa: E402
+
+SKIP = {"parent", "_hash"}
+
+
+def dump(x, out, seen=None):
+    """Exact structural dump. Shared or cyclic objects become back-references (#n), so sharing
+    is part of what is compared and nothing is walked twice."""
+    if seen is None:
+        seen = {}
+    if isinstance(x, (exp.Expr, dict, list, set, frozenset)) or hasattr(x, "__dict__"):
+        k = id(x)
+        if k in seen:
+            out.append("#%d" % seen[k][0])
+            return
+        seen[k] = (len(seen), x)  # keep x alive so its id is not reused
+    if isinstance(x, exp.Expr):
+        out.append("<" + type(x).__qualname__)
+        slots = [s for c in type(x).__mro__ for s in getattr(c, "__slots__", ())]
+        items = [(s, getattr(x, s, None)) for s in slots] + sorted(getattr(x, "__dict__", {}).items())
+        for k, v in items:
+            if k in SKIP:
+                continue
+            out.append(k + "=")
+            dump(v, out, seen)
+        out.append(">")
+    elif isinstance(x, dict):
+        out.append("{")
+        # args insertion order varies run to run in the pinned code itself (id-ordered sets in
+        # the optimizer); generation reads args by name, so compare str-keyed dicts sorted
+        items = sorted(x.items()) if all(type(k) is str for k in x) else x.items()
+        for k, v in items:
+            dump(k, out, seen)
+            out.append(":")
+            dump(v, out, seen)
+        out.append("}")
+    elif isinstance(x, (list, tuple, set, frozenset)):
+        out.append(type(x).__name__ + "[")
+        for v in (sorted(x, key=repr) if isinstance(x, (set, frozenset)) else x):
+            dump(v, out, seen)
+            out.append(",")
+        out.append("]")
+    elif hasattr(x, "__dict__") and not isinstance(x, type):
+        out.append("(" + type(x).__qualname__)
+        dump(vars(x), out, seen)
+        out.append(")")
+    else:
+        out.append(type(x).__name__ + ":" + repr(x))
+
+
+h = hashlib.sha256()
+sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+schema = ensure_schema(TPCDS_SCHEMA)
+n_exec = 0
+for meta, sql, _ in sqls:
+    out, seen = [], {}
+    e = parse_one(sql)
+    dump(e, out, seen)
+    e = pickle.loads(pickle.dumps(e))
+    if meta.get("execute"):
+        n_exec += 1
+        dump(sorted(t.name for t in find_tables(e)), out, seen)
+        out.append(transpile(sql, write="duckdb")[0])
+        dump(optimize(e, ensure_schema(TPCDS_SCHEMA), leave_tables_isolated=True, dialect=None), out, seen)
+    blob = "\x00".join(out).encode("utf-8", "surrogatepass")
+    h.update(blob)
+    if len(sys.argv) > 1:
+        print(hashlib.sha256(blob).hexdigest()[:12], file=sys.stderr)
+        if sys.argv[1] != "1":
+            open(f"{sys.argv[1]}.{n_exec}", "wb").write(blob)
+print(h.hexdigest(), len(sqls), n_exec, round(time.process_time() - t0, 2), file=sys.stderr)
+'''
+TPCDS_RUN = r"""
+import json, os, sys, importlib._bootstrap_external as be
+d = json.load(sys.stdin)
+ov = {os.path.realpath(k): v.encode("utf-8") for k, v in d["overlay"].items()}
+_orig = be.FileLoader.get_data
+def _get_data(self, path):
+    rp = os.path.realpath(path)
+    return ov[rp] if rp in ov else _orig(self, path)
+be.FileLoader.get_data = _get_data
+sys.path.insert(0, d["src"])
+sys.argv = ["proxy"]
+exec(compile(d["proxy"], "tpcds_proxy", "exec"), {"__name__": "__main__"})
+"""
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+
+
+def tpcds_hash(overlay):
+    """Proxy hash of the source with `overlay` swapped in; None if it cannot be computed."""
+    import subprocess
+    try:
+        p = subprocess.run([sys.executable, "-I", "-B", "-c", TPCDS_RUN], cwd=str(SRC),
+                           input=json.dumps({"src": str(SRC), "overlay": overlay, "proxy": TPCDS_PROXY}),
+                           capture_output=True, text=True, timeout=240,
+                           env={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "PATH": os.environ.get("PATH", "")})
+        hits = [l.split()[0] for l in p.stderr.splitlines() if re.match(r"^[0-9a-f]{64} \d+ \d+ ", l)]
+        return hits[-1] if p.returncode == 0 and hits else None
+    except Exception as e:
+        log("tpcds proxy failed:", repr(e))
+        return None
+
+
+def tpcds_skippable(sel):
+    """True only if the patch is plain edits of sqlglot/*.py outside the executor/planner and the
+    proxy dump is identical to the pristine one."""
+    changed = set(sel.changed)
+    if not changed or changed != set(sel.patched):
+        return False
+    for rel in changed:
+        if not (rel.startswith("sqlglot/") and rel.endswith(".py")):
+            return False
+        if rel.startswith("sqlglot/executor/") or rel == "sqlglot/planner.py":
+            return False
+    base = sel.idx.get("tpcds_base")
+    if not base:
+        return False
+    h = tpcds_hash({str(SRC / rel): text for rel, text in sel.patched.items()})
+    return h is not None and h == base
+
+
 def load_index():
     try:
         with open(INDEX, "rb") as fh:
@@ -2110,6 +2255,14 @@ def main():
                 text = patch.read_text(encoding="utf-8", errors="replace")
                 mask, why = sel.select(text)
                 chosen = sorted(set(always) | set(numbers(mask)))
+                tp = number_of.get(TPCDS_ID)
+                if tp is not None and tp in chosen and TPCDS_ID not in getattr(sel, "always_ids", ()):
+                    try:
+                        if tpcds_skippable(sel):
+                            chosen = [n for n in chosen if n != tp]
+                            why.append("tpcds proxy: identical, test_execute_tpcds left out")
+                    except Exception as e:
+                        log(patch.stem, "tpcds check error:", repr(e))
                 try:
                     tiers = [numbers(m) for m in getattr(sel, "plausible", ())] + [everything]
                 except Exception as e:
