@@ -180,6 +180,126 @@ def _ga(nid, obj, name):
 
 
 Probe.ga = staticmethod(_ga)
+
+
+class _Sentinel:
+    __slots__ = ()
+
+    def __repr__(self):
+        return "<BRP default>"
+
+
+def _dflt(nid, value):
+    if not ALT[0]:
+        _rec(nid, "1")
+    return value
+
+
+Probe.SENT = _Sentinel()
+Probe.dflt = staticmethod(_dflt)
+
+
+def _key_sig(k):
+    """How the selector names a dict key from source: constants by repr, enum members and
+    classes by name (a source key `exp.Foo` / `TokenType.X` maps by its last name)."""
+    import enum
+    if isinstance(k, enum.Enum):
+        return f"E:{type(k).__name__}.{k.name}"
+    if isinstance(k, type):
+        return f"T:{k.__name__}"
+    if isinstance(k, (str, int, float, bool, bytes, type(None))):
+        return f"C:{k!r}"
+    return "*"
+
+
+class TDict(dict):
+    """A module/class-level dict literal that records, per test, which keys' values are read.
+    Reads that see every value (iteration with values, copies, merges, compares) record '*'."""
+    __slots__ = ("_nid",)
+
+    def _r(self, sig):
+        if not ALT[0]:
+            _rec(self._nid, sig)
+
+    def __getitem__(self, k):
+        try:
+            self._r(_key_sig(k))
+        except TypeError:
+            self._r("*")
+        return dict.__getitem__(self, k)
+
+    def get(self, k, default=None):
+        try:
+            self._r(_key_sig(k))
+        except TypeError:
+            self._r("*")
+        return dict.get(self, k, default)
+
+    def pop(self, k, *a):
+        self._r("*")
+        return dict.pop(self, k, *a)
+
+    def setdefault(self, k, default=None):
+        self._r("*")
+        return dict.setdefault(self, k, default)
+
+    def __iter__(self):  # keys only; overriding it sends C-level merges through keys()+getitem
+        return dict.__iter__(self)
+
+    def items(self):
+        self._r("*")
+        return dict.items(self)
+
+    def values(self):
+        self._r("*")
+        return dict.values(self)
+
+    def copy(self):
+        self._r("*")
+        return dict.copy(self)
+
+    def __eq__(self, o):
+        self._r("*")
+        return dict.__eq__(self, o)
+
+    def __ne__(self, o):
+        self._r("*")
+        return dict.__ne__(self, o)
+
+    __hash__ = None
+
+    def __or__(self, o):
+        self._r("*")
+        return dict.__or__(self, o)
+
+    def __ror__(self, o):
+        self._r("*")
+        return dict.__ror__(self, o)
+
+    def __repr__(self):
+        self._r("*")
+        return dict.__repr__(self)
+
+    def __reduce_ex__(self, proto):
+        self._r("*")
+        return (dict, (dict(dict.items(self)),))
+
+    def popitem(self):
+        self._r("*")
+        return dict.popitem(self)
+
+    def update(self, *a, **kw):
+        self._r("*")
+        return dict.update(self, *a, **kw)
+
+
+def _tdict(nid, d):
+    t = TDict(d)
+    t._nid = nid
+    return t
+
+
+Probe.tdict = staticmethod(_tdict)
 builtins._BRP_ = Probe()
 
 
@@ -247,7 +367,43 @@ class Instrument(ast.NodeTransformer):
         self.depth += 1
         node.body = [self.visit(s) for s in node.body]
         self.depth -= 1
+        self._defaults(node)
         return node
+
+    def _defaults(self, node):
+        """Constant defaults become a sentinel; the body starts by recording that the call left
+        the parameter out ("dflt" node at the default's position) and restoring the constant."""
+        a = node.args
+        pos = a.posonlyargs + a.args
+        pairs = list(zip(pos[len(pos) - len(a.defaults):], range(len(a.defaults)), ["d"] * len(a.defaults)))
+        pairs += [(p, i, "k") for i, p in enumerate(a.kwonlyargs) if a.kw_defaults[i] is not None]
+        checks = []
+        for p, i, kind in pairs:
+            d = a.defaults[i] if kind == "d" else a.kw_defaults[i]
+            if not isinstance(d, ast.Constant):
+                continue
+            nid = self._nid(d, "dflt", p.arg)
+            sent = ast.Attribute(value=ast.Name("_BRP_", ast.Load()), attr="SENT", ctx=ast.Load())
+            if kind == "d":
+                a.defaults[i] = ast.copy_location(sent, d)
+            else:
+                a.kw_defaults[i] = ast.copy_location(sent, d)
+            test = ast.Compare(left=ast.Name(p.arg, ast.Load()), ops=[ast.Is()],
+                               comparators=[ast.Attribute(value=ast.Name("_BRP_", ast.Load()), attr="SENT",
+                                                          ctx=ast.Load())])
+            rec = ast.Call(func=ast.Attribute(value=ast.Name("_BRP_", ast.Load()), attr="dflt", ctx=ast.Load()),
+                           args=[ast.Constant(nid), ast.Constant(d.value)], keywords=[])
+            checks.append(ast.If(test=test, body=[ast.Assign(targets=[ast.Name(p.arg, ast.Store())], value=rec)],
+                                 orelse=[]))
+        if checks:
+            body = node.body
+            k = 1 if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                and isinstance(body[0].value.value, str) else 0
+            for c in checks:
+                ast.copy_location(c, body[k] if k < len(body) else node)
+                for x in ast.walk(c):
+                    ast.copy_location(x, c)
+            node.body = body[:k] + checks + body[k:]
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
@@ -262,6 +418,24 @@ class Instrument(ast.NodeTransformer):
         node.body = [self.visit(s) for s in node.body]
         self.depth = saved
         return node
+
+    def _wrap_dict(self, node):
+        if self.depth != 0 or not isinstance(node.value, ast.Dict):
+            return node
+        d = node.value
+        nid = self._nid(d, "dict", "")
+        node.value = ast.copy_location(ast.Call(
+            func=ast.Attribute(value=ast.Name("_BRP_", ast.Load()), attr="tdict", ctx=ast.Load()),
+            args=[ast.Constant(nid), d], keywords=[]), d)
+        return node
+
+    def visit_Assign(self, node):
+        self.generic_visit(node)
+        return self._wrap_dict(node)
+
+    def visit_AnnAssign(self, node):
+        self.generic_visit(node)
+        return self._wrap_dict(node) if node.value is not None else node
 
     def visit_Compare(self, node):
         self.generic_visit(node)

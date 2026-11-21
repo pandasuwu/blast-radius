@@ -1278,7 +1278,8 @@ class Selector:
 
     def class_attr(self, ck, name, depth=0, added=False):
         """Tests that can observe a change of attribute `name` of class `ck`."""
-        key = ("ca", ck, name, added)
+        flip = getattr(self, "flag_flip", None) == (ck, name)
+        key = ("ca", ck, name, added, flip)
         if key in self.memo:
             return self.memo[key]
         self.memo[key] = 0
@@ -1329,9 +1330,13 @@ class Selector:
                     reader = self.enclosing_class(prel, pline, pline)
                     if reader is None or own_meta is None or not self.same_class(own_meta, reader):
                         needs_outer = True
+                site = 0
                 for k, mask in sigs:
                     if k == "?" or k == ck:
-                        direct |= mask
+                        site |= mask
+                if flip and site and depth == 0:
+                    site &= self.flag_site(prel, pline, name, site)
+                direct |= site
         for u, resolved, kind, *_pos in self.idx["refs"].get(name, ()):
             urel, a, b, ukind = self.idx["units"][u][:4]
             if use_prof and kind == 1 and _pos and (urel, _pos[0], _pos[1]) in attrpos:
@@ -1552,10 +1557,10 @@ class Selector:
     def expr_diffs(a, b, out, parents, parent=None):
         """Top-most differing (old, new) node pairs, in one linear pass; records old parents.
         Returns True when a and b are equal."""
+        parents[id(a)] = parent
         if type(a) is not type(b):
             out.append((a, b))
             return False
-        parents[id(a)] = parent
         local = []
         equal = True
         here = False
@@ -1652,12 +1657,20 @@ class Selector:
                             if (isinstance(node.op, ast.And) and not t) or (isinstance(node.op, ast.Or) and t):
                                 return res
                         return res
-                    k = leaves[dump(node)]  # KeyError: an operand the old expression did not have
+                    d, flip = dump(node), False
+                    if d not in leaves:
+                        # one `not` added or dropped on an operand: its truthiness flips
+                        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+                            d, flip = dump(node.operand), True
+                        else:
+                            d, flip = dump(ast.UnaryOp(op=ast.Not(), operand=node)), True
+                    k = leaves[d]  # KeyError: an operand the old expression did not have
                     c = vec[k]
                     if c not in "01":
                         raise KeyError(c)
                     used.append(k)
-                    return k, c == "1"
+                    # a flipped operand's value is a different object: only its truthiness is known
+                    return (("flip", k) if flip else k), (c == "1") != flip
 
                 def affected(sig):
                     try:
@@ -1710,6 +1723,9 @@ class Selector:
         self.expr_diffs(o, n, pairs, parents)
         if not pairs:
             return None
+        pairs = self.lift_not_flips(pairs, parents)
+        if pairs is None:
+            return None
         m = 0
         for a, b in pairs:
             r = self.refine_pair(a, b, parents)
@@ -1717,6 +1733,30 @@ class Selector:
                 return None
             m |= r
         return m | (self.idx["untrusted"] & self.cover(self.rel, first_line(o), o.end_lineno))
+
+    @staticmethod
+    def is_not_flip(a, b):
+        """b is `not a`, or a is `not b` (one `not` added or dropped)."""
+        def neg(x, y):
+            return isinstance(x, ast.UnaryOp) and isinstance(x.op, ast.Not) and dump(x.operand) == dump(y)
+        return neg(a, b) or neg(b, a)
+
+    def lift_not_flips(self, pairs, parents):
+        """A `not` added or dropped on an operand of a profiled and/or: compare the whole and/or
+        instead, with that operand's recorded truthiness flipped (refine_pair evaluates it)."""
+        out, lifted = [], set()
+        for a, b in pairs:
+            p = parents.get(id(a))
+            if self.prof_entry(a) is None and self.is_not_flip(a, b) and isinstance(p, ast.BoolOp) \
+                    and any(v is a for v in p.values):
+                if id(p) in lifted:
+                    return None  # two operands of one and/or changed
+                lifted.add(id(p))
+                nb = ast.BoolOp(op=p.op, values=[b if v is a else v for v in p.values])
+                out.append((p, nb))
+            else:
+                out.append((a, b))
+        return out
 
     def refine_lambda_only(self, o, n):
         """A class/module-level statement whose differences all sit inside lambda bodies only
@@ -1919,6 +1959,31 @@ class Selector:
                 m |= self.class_users(new_ck) | self.name_change(o.name, ck) | self.subclass_registry(o, n)
                 m |= self.maybe_import_break(self.mod)
             return m | self.body(o.body, n.body, new_ck)
+        if ck and isinstance(o, ast.Assign) and isinstance(n, ast.Assign) and len(o.targets) == len(n.targets) == 1 \
+                and isinstance(o.targets[0], ast.Name) and dump(o.targets[0]) == dump(n.targets[0]) \
+                and isinstance(o.value, ast.Constant) and isinstance(n.value, ast.Constant) \
+                and type(o.value.value) is bool and type(n.value.value) is bool and o.value.value != n.value.value:
+            # a class flag flipped: a read that is an operand of a profiled and/or only matters
+            # where that and/or's outcome changes with the operand flipped
+            self.flag_flip = (ck, o.targets[0].id)
+            try:
+                return self.stmt(o, n, ck)
+            finally:
+                self.flag_flip = None
+        dv = self.dict_value_only(o, n)
+        if dv is not None:
+            self.why.append(f"dict values of {ck or self.mod}: {', '.join(defined_names(o))[:60]}")
+            return dv | (self.idx["untrusted"] & self.cover(self.rel, first_line(o), o.end_lineno))
+        if isinstance(o, FUNC_TYPES) and isinstance(n, FUNC_TYPES) and self.overload_stub_only(o, n):
+            # typing.overload returns a dummy and keeps the stub only for get_overloads(): its body
+            # never runs, and its defaults are constants evaluated once at import
+            self.why.append(f"overload stub {ck or self.mod}.{o.name}")
+            return 0
+        if isinstance(o, FUNC_TYPES) and isinstance(n, FUNC_TYPES):
+            dm = self.default_only(o, n)
+            if dm is not None:
+                self.why.append(f"default value of {ck or self.mod}.{o.name}")
+                return dm | (self.idx["untrusted"] & self.cover(self.rel, first_line(o), o.end_lineno))
         if isinstance(o, FUNC_TYPES) and isinstance(n, FUNC_TYPES):
             m = self.cover(self.rel, first_line(o), o.end_lineno)
             where = f"{ck or self.mod}.{o.name}"
@@ -1942,6 +2007,188 @@ class Selector:
                 self.why.append(f"function {where}")
             return m
         return self.stmt(o, n, ck)
+
+    def flag_site(self, rel, line, name, mask):
+        """Tests among `mask` whose recorded and/or evaluations change when the bool attribute
+        `name` read at rel:line flips; `mask` itself when that read is not a decidable operand."""
+        fk = ("flagtree", rel)
+        if fk not in self.memo:
+            src = self.read_src(rel)
+            try:
+                tree = ast.parse(src) if src is not None else None
+            except SyntaxError:
+                tree = None
+            parents = {}
+            if tree is not None:
+                for p in ast.walk(tree):
+                    for c in ast.iter_child_nodes(p):
+                        parents[id(c)] = p
+            self.memo[fk] = (tree, parents)
+        tree, parents = self.memo[fk]
+        if tree is None:
+            return mask
+        nodes = [x for x in ast.walk(tree) if isinstance(x, ast.Attribute) and x.attr == name
+                 and isinstance(x.ctx, ast.Load) and x.lineno == line]
+        if not nodes:
+            return mask
+        operands = []
+        for x in nodes:
+            p = parents.get(id(x))
+            if isinstance(p, ast.Assign) and p.value is x and len(p.targets) == 1 and isinstance(p.targets[0], ast.Name):
+                # `v = self.FLAG` in a function: follow v when every use is an and/or operand
+                v, fn = p.targets[0].id, parents.get(id(p))
+                while fn is not None and not isinstance(fn, FUNC_TYPES):
+                    fn = parents.get(id(fn))
+                if fn is None:
+                    return mask
+                uses = []
+                for y in ast.walk(fn):
+                    if isinstance(y, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and y is not fn and \
+                            any(a.arg == v for a in ast.walk(y.args) if isinstance(a, ast.arg)):
+                        return mask  # shadowed in a nested scope
+                    if isinstance(y, ast.Name) and y.id == v:
+                        if isinstance(y.ctx, ast.Load):
+                            uses.append(y)
+                        elif y is not p.targets[0]:
+                            return mask  # reassigned / deleted elsewhere
+                    if isinstance(y, (ast.Global, ast.Nonlocal)) and v in y.names:
+                        return mask
+                operands += uses
+            else:
+                operands.append(x)
+        nodes = operands
+        saved, self.rel = self.rel, rel
+        try:
+            out = 0
+            for x in nodes:
+                p = parents.get(id(x))
+                if isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not):
+                    x, p = p, parents.get(id(p))
+                if not (isinstance(p, ast.BoolOp) and any(v is x for v in p.values)):
+                    return mask
+                flipped = x.operand if isinstance(x, ast.UnaryOp) else ast.UnaryOp(op=ast.Not(), operand=x)
+                nb = ast.BoolOp(op=p.op, values=[flipped if v is x else v for v in p.values])
+                r = self.refine_pair(p, nb, parents)
+                if r is None:
+                    return mask
+                out |= r
+            return out
+        finally:
+            self.rel = saved
+
+    @staticmethod
+    def dict_key_match(k):
+        """A source dict key -> predicate over the profile's runtime key names (see profplugin
+        _key_sig), or None when the key cannot be named. Names match loosely (a superset)."""
+        if isinstance(k, ast.Constant) and isinstance(k.value, (str, int, float, bool, bytes, type(None))):
+            s = "C:" + repr(k.value)
+            return lambda sig: sig == s
+        c = chain(k) if k is not None else None
+        if c:
+            last = c[-1]
+            return lambda sig: sig == "T:" + last or (sig.startswith("E:") and sig.endswith("." + last))
+        return None
+
+    def dict_value_only(self, o, n):
+        """Tests that read a changed value of a module/class-level dict literal, when values of
+        existing keys are the statement's only change; None when the profile cannot tell."""
+        if type(o) is not type(n) or not isinstance(o, (ast.Assign, ast.AnnAssign)):
+            return None
+        if not isinstance(o.value, ast.Dict) or not isinstance(n.value, ast.Dict):
+            return None
+        to = o.targets if isinstance(o, ast.Assign) else [o.target]
+        tn = n.targets if isinstance(n, ast.Assign) else [n.target]
+        if [dump(x) for x in to] != [dump(x) for x in tn]:
+            return None
+        if isinstance(o, ast.AnnAssign) and dump(o.annotation) != dump(n.annotation):
+            return None
+        a, b = o.value, n.value
+        if len(a.keys) != len(b.keys):
+            return None
+        e = self.prof_entry(a)
+        if e is None or e[0] != "dict":
+            return None
+        preds = []
+        for ka, kb, va, vb in zip(a.keys, b.keys, a.values, b.values):
+            if (dump(ka) if ka is not None else None) != (dump(kb) if kb is not None else None):
+                return None
+            if dump(va) == dump(vb):
+                continue
+            p = self.dict_key_match(ka)
+            if p is None or not self.safe_expr(vb):
+                return None
+            preds.append(p)
+        if not preds:
+            return None
+        hit = lambda sig: sig == "*" or any(p(sig) for p in preds)  # noqa: E731
+        if any(hit(s) for s in e[2]):
+            return None  # read at import time
+        m = 0
+        for sig, mask in e[3]:
+            if hit(sig):
+                m |= mask
+        return m
+
+    def default_only(self, o, n):
+        """Tests that called the function leaving out a parameter whose constant default changed,
+        when that is the function's whole change; None when the profile cannot tell."""
+        if type(o) is not type(n) or o.name != n.name or [dump(x) for x in o.body] != [dump(x) for x in n.body]:
+            return None
+        if [dump(x) for x in o.decorator_list] != [dump(x) for x in n.decorator_list]:
+            return None
+        if (dump(o.returns) if o.returns else None) != (dump(n.returns) if n.returns else None):
+            return None
+        oa, na = o.args, n.args
+        olds = list(oa.defaults) + [d for d in oa.kw_defaults]
+        news = list(na.defaults) + [d for d in na.kw_defaults]
+        if len(olds) != len(news) or len(oa.defaults) != len(na.defaults):
+            return None
+        for f in ("posonlyargs", "args", "kwonlyargs", "vararg", "kwarg"):
+            x, y = getattr(oa, f), getattr(na, f)
+            if (dump(x) if isinstance(x, ast.AST) else [dump(v) for v in x] if x else x) != \
+                    (dump(y) if isinstance(y, ast.AST) else [dump(v) for v in y] if y else y):
+                return None
+        m, changed = 0, False
+        for a, b in zip(olds, news):
+            if (a is None) != (b is None):
+                return None
+            if a is None or dump(a) == dump(b):
+                continue
+            if not (isinstance(a, ast.Constant) and isinstance(b, ast.Constant)):
+                return None
+            e = self.prof_entry(a)
+            if e is None or e[0] != "dflt" or e[2]:
+                return None  # not profiled, or called with the default at import time
+            changed = True
+            for _sig, mask in e[3]:
+                m |= mask
+        return m if changed else None
+
+    OVERLOAD_DECOS = {("t", "overload"), ("typing", "overload"), ("overload",)}
+
+    def overload_stub_only(self, o, n):
+        """o and n are the same @overload stub except for its arguments, annotations or body, and
+        everything the new stub evaluates at import is a plain constant or a name the old code has."""
+        if type(o) is not type(n) or o.name != n.name or len(o.decorator_list) != 1:
+            return False
+        if [dump(x) for x in o.decorator_list] != [dump(x) for x in n.decorator_list]:
+            return False
+        c = tuple(chain(o.decorator_list[0]) or ())
+        if c not in self.OVERLOAD_DECOS:
+            return False
+        text = self.old_text
+        if c[0] == "t" and "import typing as t" not in text:
+            return False
+        if c == ("overload",) and not re.search(r"from typing(_extensions)? import [^\n]*\boverload\b", text):
+            return False
+        if "tests/" in self.rel or self.rel.startswith("sqlglot/typing/"):
+            return False  # test_typing compares code objects of sqlglot/typing
+        lazy = "from __future__ import annotations" in text
+        evals = [d for d in n.args.defaults + n.args.kw_defaults if d is not None]
+        if not lazy:
+            args = n.args.posonlyargs + n.args.args + n.args.kwonlyargs + [a for a in (n.args.vararg, n.args.kwarg) if a]
+            evals += [a.annotation for a in args if a.annotation is not None] + ([n.returns] if n.returns else [])
+        return all(self.safe_expr(e) for e in evals)
 
     def same_decorators(self, olds, news):
         """Equal, or differing only in constant arguments of identity decorator factories."""
