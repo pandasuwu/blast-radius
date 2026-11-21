@@ -58,6 +58,28 @@ def skip_max_nodes(why):
     return True
 
 
+# Variant: leave out test_execute_tpcds (21.5 s) when every changed Python file is a
+# dialect-specific module and no import-related rule fired. With ground truth it failed in
+# 0 of ~15 such commits (vs 17 of 81 overall); break-even for a 300 s miss is ~7%.
+GAMBLE_TPCDS = True
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+DIALECT_SPECIFIC = re.compile(r"^sqlglot/(generators|parsers|typing|tokenizers)/(?!__init__)\w+\.py$"
+                              r"|^sqlglot/dialects/(?!dialect\.py|__init__)\w+\.py$|^sqlglot/jsonpath\.py$")
+
+
+def skip_tpcds(why, changed):
+    text = "; ".join(why)
+    for risky in ("import-time", "syntax error", "deleted module", "new module", "stmt without names",
+                  "class header", "fixture", "may raise"):
+        if risky in text:
+            return False
+    if "import check" in text and "-> failed []" not in text:
+        return False
+    py = [c for c in changed if c and c.endswith(".py")]
+    others = [c for c in changed if c and not c.endswith(".py")]
+    return bool(py) and not others and all(DIALECT_SPECIFIC.match(c) for c in py)
+
+
 IMPORT_CHECK = r"""
 import contextlib, importlib, importlib._bootstrap_external as be, io, json, os, sys
 d = json.load(sys.stdin)
@@ -1999,6 +2021,7 @@ def main():
         known = set(map_tests) - set(idx["missing"])
         always = [t["number"] for t in tests if t["id"] not in known]
         max_nodes = number_of.get(MAX_NODES_ID, -1)
+        tpcds = number_of.get(TPCDS_ID, -1)
         to_number = [number_of.get(t) for t in map_tests]
     except Exception as e:
         log("selector unavailable, running everything:", repr(e))
@@ -2020,6 +2043,9 @@ def main():
                 if GAMBLE_MAX_NODES and skip_max_nodes(why) and max_nodes in nums:
                     chosen.remove(max_nodes)
                     log(patch.stem, "gamble: max_nodes left out")
+                if GAMBLE_TPCDS and tpcds in chosen and max_nodes not in chosen and skip_tpcds(why, sel.changed):
+                    chosen.remove(tpcds)
+                    log(patch.stem, "gamble: tpcds left out")
                 log(patch.stem, len(chosen), "tests;", "; ".join(why)[:300])
             except Everything as e:
                 log(patch.stem, "everything:", e)
