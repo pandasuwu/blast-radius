@@ -3236,7 +3236,11 @@ def child(req):
     for ch in req.get("changes", ()):
         mod = sys.modules.get(ch["module"])
         if mod is None:
-            return {"ok": False, "bad": ["swap", "module not loaded " + ch["module"]]}
+            if not ch.get("path"):
+                return {"ok": False, "bad": ["swap", "module not loaded " + ch["module"]]}
+            # nothing holds the module yet: the tests import it fresh, from the patched source
+            install_overlay({ch["path"]: ch["source"]})
+            continue
         code = compile(ch["source"], mod.__file__, "exec")
         for q in ch["functions"]:
             new, f = find_code(code, q), live_function(mod, q)
@@ -3389,7 +3393,8 @@ def swappable_changes(sel):
                    and first_line(n) <= hi and lo <= n.end_lineno for n in ast.walk(fn) if n is not fn):
                 return None  # touches a nested def, lambda or class
             names.add(".".join(s.name for s in chain[:funcs[0] + 1]))
-        out.append({"module": module_name(rel), "source": sel.patched[rel], "functions": sorted(names)})
+        out.append({"module": module_name(rel), "source": sel.patched[rel], "functions": sorted(names),
+                    "path": str(SRC / rel)})
     return out or None
 
 
