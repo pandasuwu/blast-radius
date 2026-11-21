@@ -2641,6 +2641,9 @@ for line in sys.stdin:
 VERIFY_MAX_COST_MS = 6000  # only selections this cheap are worth verifying (~2 s saved when all pass)
 VERIFY_HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")  # third-party deps, shared pools
 VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET", "140"))  # wall clock since start
+# Off by default: on the practice board v5.7 verified 1 commit clean (-2.0 s simulated) for +2.4 s CPU
+# (zygote 0.6 s, ~0.4 s per check; only ~13-20% of checks end in "all pass"). BR_VERIFY=1 turns it on.
+VERIFY_ON = os.environ.get("BR_VERIFY") == "1"
 
 
 class Zygote:
@@ -2819,7 +2822,7 @@ def main():
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
-                if chosen and time.monotonic() - started < VERIFY_BUDGET_S \
+                if VERIFY_ON and chosen and time.monotonic() - started < VERIFY_BUDGET_S \
                         and plan_cost(pack(chosen, durations), durations) < VERIFY_MAX_COST_MS \
                         and not any(tests[n]["file"] in VERIFY_HEAVY for n in chosen):
                     try:
