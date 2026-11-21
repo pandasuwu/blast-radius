@@ -2178,11 +2178,29 @@ def result_digest(table):
     return hashlib.sha256(repr((list(table.columns), rows)).encode()).hexdigest()[:20]
 
 
+def _as_test_sees(v):
+    """What the test's assert_frame_equal(duckdb_df, DataFrame(rows), check_dtype=False) can tell
+    apart: None becomes NaN, numbers compare by value whatever their type. Exact otherwise."""
+    if v is None or (isinstance(v, float) and v != v):
+        return ("nan",)
+    if isinstance(v, bool):
+        return ("bool", v)
+    if isinstance(v, (int, float)) or type(v).__name__ == "Decimal":
+        f = float(v)
+        return ("num", 0.0 if f == 0 else f)
+    return (type(v).__name__, v)
+
+
+def loose_digest(table):
+    rows = [tuple(_as_test_sees(v) for v in r) for r in table.rows]
+    return hashlib.sha256(repr((list(table.columns), rows)).encode()).hexdigest()[:20]
+
+
 def run(e, names, tables):
     t = time.process_time()
     tabs = pickle.loads(pickle.dumps({n: tables[n] for n in names}))  # pool initargs + per-query dict
     r = pickle.loads(pickle.dumps(execute(e, schema=TPCDS_SCHEMA, tables=tabs)))
-    return result_digest(r), time.process_time() - t
+    return (result_digest(r), loose_digest(r)), time.process_time() - t
 
 
 def verdict(**k):
@@ -2224,17 +2242,18 @@ for i, (meta, sql, _) in enumerate(sqls):
                 est += time.process_time() - t1
         if est > BUDGET:
             verdict(ok=False, why=f"query {i}: loading its tables spent the budget")
-        if run(pickle.loads(blob), names, tables)[0] != REF["res"][str(i)]:
+        (strict, loose), _ = run(pickle.loads(blob), names, tables)
+        if strict != REF["res"][str(i)] and loose != REF["lres"][str(i)]:
             verdict(ok=False, why=f"query {i}: different rows")
         todo.append((i, blob, names))
 if REF is None:
     for n in sorted({n for _, _, ns in todo for n in ns}):
         tables[n] = load_table(n)
-    res, sec = {}, {}
+    res, lres, sec = {}, {}, {}
     for i, blob, names in todo:
-        res[str(i)], sec[str(i)] = run(pickle.loads(blob), names, tables)
-    print("REF " + json.dumps({"parts": parts, "res": res, "sec": {k: round(v, 3) for k, v in sec.items()}}),
-          file=sys.stderr)
+        (res[str(i)], lres[str(i)]), sec[str(i)] = run(pickle.loads(blob), names, tables)
+    print("REF " + json.dumps({"parts": parts, "res": res, "lres": lres,
+                               "sec": {k: round(v, 3) for k, v in sec.items()}}), file=sys.stderr)
     verdict(ok=True, ref=True)
 verdict(ok=True, executed=[i for i, _, _ in todo])
 '''
