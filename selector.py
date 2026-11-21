@@ -2591,6 +2591,13 @@ def tpcds_skippable(sel, budget=0.0):
                     lines |= set(range(first_line(chain[-1]), chain[-1].end_lineno + 1))
                 il = set(sel.idx["importlines"].get(rel, ()))
                 xc = sel.idx.get("tpcds_xcov")
+                if not hasattr(sel, "pj_group"):
+                    # PROBE J: which file and why the execution proof needs its queries
+                    sel.pj_group = (1 if rel == "sqlglot/serde.py" else 2 if rel.startswith("sqlglot/executor/")
+                                    else 3 if rel == "sqlglot/planner.py" else 4 if rel.startswith("sqlglot/optimizer/")
+                                    else 5 if rel.startswith("sqlglot/expressions") else 6)
+                    sel.pj_reason = 1 if xc is not None and lines & il else 2 if xc is None or not any(
+                        isinstance(s, FUNC_TYPES) for s in chain) else 3
                 if xc is None or lines & il or not any(isinstance(s, FUNC_TYPES) for s in chain):
                     exec_set = None  # import-time change, or no map: execute every query
                 elif exec_set is not None:
@@ -2615,7 +2622,13 @@ def tpcds_skippable(sel, budget=0.0):
                      limit=TPCDS_MARGIN_S + max(budget, 0), exec_all=exec_all, exec_set=qs)
     why.append("tpcds check: " + (f"same rows, executed {v.get('executed')}" if v.get("ok") else v.get("why", "?"))
                + f" ({v.get('cpu')} s)")
+    if exec_all and v.get("ok") and hasattr(sel, "pj_group"):
+        PJ[sel.stem if hasattr(sel, "stem") else id(sel)] = (sel.pj_group, sel.pj_reason)
+        sel.pj_ok = True
     return bool(v.get("ok"))
+
+
+PJ = {}
 
 
 # Runtime verification of small selections (v5.7). The rules allow running sqlglot's tests while
@@ -3013,6 +3026,8 @@ def main():
                                 tpcds_skippable(sel, min(TPCDS_EXEC_CAP_S, saving / 1000 - TPCDS_MARGIN_S)):
                             chosen = [n for n in chosen if n != tp]
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
+                            if getattr(sel, "pj_ok", False):
+                                PJ[patch.stem] = (sel.pj_group, sel.pj_reason)
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
                 if VERIFY_ON and chosen and time.monotonic() - started < VERIFY_BUDGET_S \
@@ -3047,6 +3062,20 @@ def main():
         except Exception as e:
             log(patch.stem, "free riders failed:", repr(e))
             workers = pack(chosen, durations)
+        if patch.stem in PJ:
+          try:
+            # PROBE J (measurement only): sim +2 s per reason marker, CPU +2 s per file group
+            group, reason = PJ[patch.stem]
+            used = {n for w in workers for n in w}
+            spare = sorted((n for n in range(len(durations)) if n not in used), key=lambda n: durations[n])
+            for n in spare[:max(0, min(reason, MAX_WORKERS - len([w for w in workers if w])))]:
+                workers.append([n])
+            t_busy = time.process_time()
+            while time.process_time() - t_busy < 2.0 * group:
+                pass
+            log(patch.stem, "PROBE J:", group, reason)
+          except Exception as e:
+            log(patch.stem, "PROBE J failed:", repr(e))
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     if zyg is not None:
         zyg.close()
