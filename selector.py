@@ -2893,6 +2893,10 @@ def main():
                             why.append(f"PROBE G: file-kind refusal {markers}; dropped, {markers} markers")
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
+                        # PROBE G: an exception in the check machinery -> drop anyway, 6 markers
+                        markers = 6
+                        chosen = [n for n in chosen if n != tp]
+                        why.append("PROBE G: check raised; dropped, 6 markers")
                 if VERIFY_ON and chosen and time.monotonic() - started < VERIFY_BUDGET_S \
                         and plan_cost(pack(chosen, durations), durations) < VERIFY_MAX_COST_MS \
                         and not any(tests[n]["file"] in VERIFY_HEAVY for n in chosen):
