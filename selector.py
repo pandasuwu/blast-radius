@@ -66,6 +66,209 @@ for m in d["mods"]:
 print(json.dumps({"failed": failed}))
 """  # evaluation: force the full-file parse path
 
+# Import-time state diff (v7.1). Imports every sqlglot module (sorted, so registries fill in the
+# same order) with the patched sources swapped in and digests each module global and each class's
+# own __dict__ entries. Run with PYTHONHASHSEED=0 at build time (pristine) and per commit; prints the
+# keys whose digest differs from the pristine one. Code objects are compared without line numbers,
+# so moved code is not a change. A value it cannot see into is "opaque": the key counts as changed
+# if its opaque part's type differs, so equality is only claimed for values it fully describes.
+STATE_DUMP = r"""
+import contextlib, importlib, importlib.util, importlib._bootstrap_external as be, io, json, os, sys, types, enum
+import hashlib, functools, re as _re
+d = json.load(sys.stdin)
+ov = {os.path.realpath(k): v.encode("utf-8") for k, v in d["overlay"].items()}
+_orig = be.FileLoader.get_data
+def _get_data(self, path):
+    rp = os.path.realpath(path)
+    if rp.endswith(".pyc"):
+        try:
+            src_rp = os.path.realpath(importlib.util.source_from_cache(path))
+        except Exception:
+            raise OSError("unknown bytecode: compile from source")
+        if src_rp in ov:
+            raise OSError("bytecode of a patched file: compile from source")
+    return ov[rp] if rp in ov else _orig(self, path)
+be.FileLoader.get_data = _get_data
+sys.path.insert(0, d["src"])
+failed = []
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    for m in d["mods"]:
+        try:
+            importlib.import_module(m)
+        except BaseException:
+            failed.append(m)
+memo, opaque = {}, set()
+SORT = [False]  # order-insensitive digests (keys whose order varies from run to run)
+NOCODE = [False]  # digests that ignore code objects (a function whose only change is its code)
+SKIP = {"__builtins__", "__loader__", "__spec__", "__file__", "__cached__", "__path__", "__package__"}
+def H(s):
+    return hashlib.blake2b(s.encode("utf-8", "surrogatepass"), digest_size=10).hexdigest()
+def code_dg(c):
+    if NOCODE[0]:
+        return "code"
+    parts = [c.co_code.hex(), repr(c.co_names), repr(c.co_varnames), repr(c.co_freevars), repr(c.co_cellvars),
+             str(c.co_flags), str(c.co_argcount), str(c.co_kwonlyargcount), str(c.co_posonlyargcount)]
+    for k in c.co_consts:
+        parts.append(code_dg(k) if isinstance(k, types.CodeType) else dg(k))
+    return H("|".join(parts))
+def dg(v, depth=0):
+    i = id(v)
+    r = memo.get(i)
+    if r is not None:
+        return r
+    memo[i] = "cyc"
+    try:
+        r = _dg(v, depth)
+    except Exception as e:
+        r = "opaque:" + type(e).__name__
+        opaque.add(r)
+    memo[i] = r
+    return r
+def _dg(v, depth):
+    t = type(v)
+    if v is None or t in (bool, int, float, complex, str, bytes):
+        return t.__name__ + ":" + (repr(v) if t is not str or len(v) < 64 else H(v))
+    if isinstance(v, enum.Enum):
+        return "E:" + t.__module__ + "." + t.__qualname__ + "." + v.name
+    if isinstance(v, type):
+        return "T:" + v.__module__ + "." + v.__qualname__
+    if isinstance(v, types.ModuleType):
+        return "M:" + v.__name__
+    if depth > 40:
+        opaque.add("deep")
+        return "opaque:deep"
+    if t in (tuple, list) or isinstance(v, (tuple, list)):
+        items = [dg(x, depth + 1) for x in v]
+        return H("L" + t.__qualname__ + "(" + ",".join(sorted(items) if SORT[0] else items))
+    if isinstance(v, dict):
+        items = [dg(k, depth + 1) + ":" + dg(x, depth + 1) for k, x in v.items()]
+        return H("D" + t.__qualname__ + "(" + ",".join(sorted(items) if SORT[0] else items))
+    if isinstance(v, (set, frozenset)):
+        return H("S" + t.__qualname__ + "(" + ",".join(sorted(dg(x, depth + 1) for x in v)))
+    if isinstance(v, types.FunctionType):
+        cells = []
+        for c in v.__closure__ or ():
+            try:
+                cells.append(dg(c.cell_contents, depth + 1))
+            except ValueError:
+                cells.append("empty")
+        return H("F" + v.__module__ + "." + v.__qualname__ + code_dg(v.__code__) + dg(v.__defaults__, depth + 1)
+                 + dg(v.__kwdefaults__, depth + 1) + ",".join(cells) + dg(getattr(v, "__wrapped__", None), depth + 1)
+                 + dg({k: x for k, x in v.__dict__.items() if k != "__wrapped__"}, depth + 1))
+    if isinstance(v, types.CodeType):
+        return code_dg(v)
+    if isinstance(v, (staticmethod, classmethod)):
+        return H(t.__name__ + dg(v.__func__, depth + 1))
+    if isinstance(v, property):
+        return H("P" + dg(v.fget, depth + 1) + dg(v.fset, depth + 1) + dg(v.fdel, depth + 1))
+    if isinstance(v, functools.partial):
+        return H("p" + dg(v.func, depth + 1) + dg(v.args, depth + 1) + dg(v.keywords, depth + 1))
+    if isinstance(v, types.MethodType):
+        return H("m" + dg(v.__func__, depth + 1) + dg(v.__self__, depth + 1))
+    if isinstance(v, (types.BuiltinFunctionType, types.BuiltinMethodType, types.WrapperDescriptorType,
+                      types.MethodDescriptorType, types.MethodWrapperType, types.ClassMethodDescriptorType)):
+        s = getattr(v, "__self__", None)
+        return H("B" + str(getattr(v, "__module__", "")) + "." + getattr(v, "__qualname__", repr(t))
+                 + ("" if s is None or isinstance(s, types.ModuleType) else dg(s, depth + 1)))
+    if isinstance(v, _re.Pattern):
+        return H("R" + repr(v.pattern) + str(v.flags))
+    tn = t.__module__ + "." + t.__qualname__
+    if tn == "builtins.member_descriptor":
+        return "slot:" + v.__objclass__.__qualname__ + "." + v.__name__
+    if tn in ("typing.TypeVar", "datetime.date", "datetime.datetime", "datetime.time", "datetime.timedelta",
+              "decimal.Decimal"):
+        return tn + ":" + repr(v)
+    if tn in ("_thread.RLock", "_thread.lock", "_abc._abc_data"):
+        return tn  # synchronisation / ABC caches: no program state
+    if tn == "collections._tuplegetter":
+        return "tg:" + str(v.__doc__)
+    if tn in ("builtins.dict_values", "builtins.dict_keys", "builtins.dict_items"):
+        return H(tn + dg(list(v), depth + 1))
+    if isinstance(v, (functools._lru_cache_wrapper,)):
+        return H("C" + dg(v.__wrapped__, depth + 1))
+    st = {}
+    if hasattr(v, "__dict__") and isinstance(getattr(v, "__dict__", None), dict):
+        st.update(v.__dict__)
+    for c in t.__mro__:
+        for sl in c.__dict__.get("__slots__", ()) if isinstance(c.__dict__.get("__slots__", ()), (tuple, list)) else (c.__dict__["__slots__"],):
+            if sl in ("__dict__", "__weakref__"):
+                continue
+            try:
+                st["slot:" + sl] = getattr(v, sl)
+            except AttributeError:
+                st["slot:" + sl] = "<unset>"
+    if st or hasattr(v, "__dict__") or any("__slots__" in c.__dict__ for c in t.__mro__[:-1]):
+        return H("O" + t.__module__ + "." + t.__qualname__ + dg(st, depth + 1))
+    opaque.add(t.__module__ + "." + t.__qualname__)
+    return "opaque:" + t.__module__ + "." + t.__qualname__
+out = {}
+def walk_class(mod, qual, cls):
+    for a, v in list(cls.__dict__.items()):
+        if a in ("__dict__", "__weakref__"):
+            continue
+        out[mod + ":" + qual + "|" + a] = dg(v)
+        if isinstance(v, type) and v.__module__ == mod and v.__qualname__ == qual + "." + a:
+            walk_class(mod, v.__qualname__, v)
+for name in sorted(n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot.")):
+    mod = sys.modules[name]
+    if mod is None:
+        continue
+    for a, v in list(vars(mod).items()):
+        if a in SKIP:
+            continue
+        out[name + "|" + a] = dg(v)
+        if isinstance(v, type) and v.__module__ == name and v.__qualname__ == a:
+            walk_class(name, a, v)
+unordered = set(d.get("unordered", ()))
+if unordered:
+    # order-insensitive digests for the keys given (fresh memo: digests differ by mode)
+    SORT[0] = True
+    memo.clear()
+    for k in sorted(unordered):
+        if k not in out:
+            continue
+        where, _, attr = k.rpartition("|")
+        modname, _, qual = where.partition(":")
+        obj = sys.modules.get(modname)
+        try:
+            for part in qual.split(".") if qual else ():
+                obj = vars(obj)[part]
+            out[k] = dg(vars(obj)[attr])
+        except Exception:
+            out[k] = "opaque:unresolved"
+def resolve(k):
+    where, _, attr = k.rpartition("|")
+    modname, _, qual = where.partition(":")
+    obj = sys.modules.get(modname)
+    for part in qual.split(".") if qual else ():
+        obj = vars(obj)[part]
+    return vars(obj)[attr]
+FUNC_LIKE = (types.FunctionType, staticmethod, classmethod, property, functools.partial)
+def nocode(keys):
+    NOCODE[0] = True
+    memo.clear()
+    res = {}
+    for k in keys:
+        try:
+            v = resolve(k)
+            if isinstance(v, FUNC_LIKE):
+                res[k] = dg(v)
+        except Exception:
+            pass
+    NOCODE[0] = False
+    memo.clear()
+    return res
+ref = d.get("ref")
+if ref is None:
+    print("STATE " + json.dumps({"state": out, "failed": failed, "opaque": sorted(opaque),
+                                 "nocode": nocode(sorted(out))}))
+else:
+    changed = sorted(k for k in set(out) | set(ref) if out.get(k) != ref.get(k) or str(out.get(k, "")).startswith("opaque"))
+    nc, ref_nc = nocode(changed), d.get("ref_nocode", {})
+    code_only = [k for k in changed if k in nc and k in ref_nc and nc[k] == ref_nc[k]]
+    print("STATE " + json.dumps({"changed": changed, "code_only": code_only, "failed": failed}))
+"""
+
 
 def log(*a):
     print(*a, file=sys.stderr)
@@ -724,7 +927,45 @@ def build_index():
         log("tpcds proxy disabled:", repr(e))
         idx["tpcds_base"] = None
     log("tpcds proxy baseline:", idx["tpcds_base"])
+    try:
+        # off by default (BR_STATE=1): on the labelled sets it did not pay for its CPU
+        idx["state_ref"] = build_state_ref(idx) if os.environ.get("BR_STATE", "0") == "1" else None
+    except Exception as e:
+        log("state diff disabled:", repr(e))
+        idx["state_ref"] = None
     return idx
+
+
+STATE_TIMEOUT_S = 60
+
+
+def state_run(mods, overlay, extra):
+    import subprocess
+    p = subprocess.run([sys.executable, "-I", "-B", "-c", STATE_DUMP],
+                       input=json.dumps({"src": str(SRC), "mods": mods, "overlay": overlay, **extra}),
+                       capture_output=True, text=True, timeout=STATE_TIMEOUT_S,
+                       env={"PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp",
+                            "PATH": os.environ.get("PATH", "")})
+    out = [l for l in p.stdout.splitlines() if l.startswith("STATE ")]
+    if not out:
+        raise RuntimeError("state dump failed: " + p.stderr[-300:])
+    return json.loads(out[-1][6:])
+
+
+def build_state_ref(idx):
+    """Pristine import-time state digests. Keys whose digest varies between runs are compared
+    order-insensitively; keys that still vary are 'volatile' (always counted as changed)."""
+    mods = sorted(m for m in idx["modules"] if m.startswith("sqlglot") and m != "sqlglot.__main__")
+    a, b = state_run(mods, {}, {}), state_run(mods, {}, {})
+    if a["failed"] != b["failed"]:
+        raise RuntimeError("pristine import failures vary")
+    unordered = sorted(k for k in set(a["state"]) | set(b["state"]) if a["state"].get(k) != b["state"].get(k))
+    c, e = state_run(mods, {}, {"unordered": unordered}), state_run(mods, {}, {"unordered": unordered})
+    volatile = sorted(k for k in set(c["state"]) | set(e["state"]) if c["state"].get(k) != e["state"].get(k))
+    log("state ref:", len(c["state"]), "keys,", len(unordered), "unordered,", len(volatile), "volatile,",
+        len(c["failed"]), "modules fail to import")
+    return {"mods": [m for m in mods if m not in c["failed"]], "failed": c["failed"], "ref": c["state"],
+            "nocode": c["nocode"], "unordered": unordered, "volatile": volatile}
 
 
 def shared_pool_groups(test_ids):
@@ -987,6 +1228,43 @@ class Selector:
                 m |= s
         m |= self.idx["mod_refmask"].get(mod, 0)
         self.memo[key] = m
+        return m
+
+    def import_time_change(self, fallback):
+        """An import-time code change: decided by the state diff at the end of select() (readers of
+        every module global / class attribute whose import-time value changed); `fallback` is
+        selected instead if the diff cannot run."""
+        if self.idx.get("state_ref") and os.environ.get("BR_STATE", "0") == "1":
+            self.pending_state.append(fallback)
+            return 0
+        return fallback
+
+    def state_readers(self):
+        sr = self.idx.get("state_ref")
+        if not sr:
+            return None
+        try:
+            r = state_run(sr["mods"], {str(SRC / rel): text for rel, text in self.patched.items()},
+                          {"ref": sr["ref"], "unordered": sr["unordered"], "ref_nocode": sr["nocode"]})
+        except Exception as e:
+            log("state diff failed:", repr(e))
+            self.why.append("state diff failed")
+            return None
+        if r["failed"]:
+            self.why.append(f"state diff: import fails {r['failed'][:3]}")
+            return None
+        code_only = set(r.get("code_only", ()))
+        changed = sorted((set(r["changed"]) - code_only) | set(sr["volatile"]))
+        self.why.append(f"state diff: {len(changed)} changed ({', '.join(changed[:4])})")
+        if len(changed) > 400:
+            return None
+        m = 0
+        for k in changed:
+            where, _, attr = k.rpartition("|")
+            if ":" in where:
+                m |= self.class_attr(where, attr)
+            else:
+                m |= self.module_name(where, attr)
         return m
 
     def maybe_import_break(self, mod):
@@ -1301,7 +1579,12 @@ class Selector:
             for prel, pline, imp, sigs in self.idx["attrprof"].get(name, ()):
                 if (prel, pline, name) in skip:
                     continue  # the receiver of a derivation's mutating call (see derived_attrs)
+                # a flipped flag whose every use from this read is an and/or operand that keeps its
+                # outcome in every import-time evaluation: what import-time code computed is unchanged
+                imp_same = flip and depth == 0 and imp and self.flag_imp_unchanged(prel, pline, name)
                 for k in imp:
+                    if imp_same:
+                        break
                     key_, _, loc = k.partition("@")
                     if key_ != "?" and key_ != ck:
                         continue
@@ -1335,7 +1618,9 @@ class Selector:
                     if k == "?" or k == ck:
                         site |= mask
                 if flip and site and depth == 0:
-                    site &= self.flag_site(prel, pline, name, site)
+                    # no import-time read took ck's value: import-time evaluations downstream cannot see it
+                    ck_at_import = any(k.partition("@")[0] in ("?", ck) for k in imp)
+                    site &= self.flag_site(prel, pline, name, site, ignore_imp=not ck_at_import)
                 direct |= site
         for u, resolved, kind, *_pos in self.idx["refs"].get(name, ()):
             urel, a, b, ukind = self.idx["units"][u][:4]
@@ -1542,10 +1827,10 @@ class Selector:
         if import_time:
             ck = owner_ctx[1] if owner_ctx[0] == "c" else None
             self.why.append(f"import-time code in {func.name}")
-            m |= self.import_break(self.mod)
-            m |= self.name_change(func.name, ck)
+            fb = self.import_break(self.mod) | self.name_change(func.name, ck)
             if ck:
-                m |= self.class_users(ck)
+                fb |= self.class_users(ck)
+            m |= self.import_time_change(fb)
         else:
             self.why.append(f"lines in {func.name}")
         return m
@@ -1620,7 +1905,7 @@ class Selector:
         for _o in _f[:4]:
             CMP_FAMILY.setdefault(_o, _f)
 
-    def refine_pair(self, a, b, parents):
+    def refine_pair(self, a, b, parents, ignore_imp=False):
         """Tests whose recorded evaluations of old node `a` differ under new node `b`;
         None when the profile cannot decide (not instrumented, or an import-time
         evaluation would change)."""
@@ -1685,7 +1970,7 @@ class Selector:
                         return True
         if affected is None:
             return None
-        if any(affected(sg) for sg in imp_sigs):
+        if not ignore_imp and any(affected(sg) for sg in imp_sigs):
             return None
         m = 0
         for sig, mask in sigs:
@@ -2000,17 +2285,16 @@ class Selector:
                 body_import = False  # only the signature changed (handled above)
             if body_import:
                 self.why.append(f"import-time function {where}")
-                m |= self.name_change(o.name, ck) | self.import_break(self.mod)
+                fb = self.name_change(o.name, ck) | self.import_break(self.mod)
                 if ck:
-                    m |= self.class_users(ck)
+                    fb |= self.class_users(ck)
+                m |= self.import_time_change(fb)
             else:
                 self.why.append(f"function {where}")
             return m
         return self.stmt(o, n, ck)
 
-    def flag_site(self, rel, line, name, mask):
-        """Tests among `mask` whose recorded and/or evaluations change when the bool attribute
-        `name` read at rel:line flips; `mask` itself when that read is not a decidable operand."""
+    def _tree_parents(self, rel):
         fk = ("flagtree", rel)
         if fk not in self.memo:
             src = self.read_src(rel)
@@ -2024,43 +2308,27 @@ class Selector:
                     for c in ast.iter_child_nodes(p):
                         parents[id(c)] = p
             self.memo[fk] = (tree, parents)
-        tree, parents = self.memo[fk]
+        return self.memo[fk]
+
+    def flag_site(self, rel, line, name, mask, ignore_imp=False):
+        """Tests among `mask` whose recorded and/or evaluations change when the bool attribute
+        `name` read at rel:line flips; `mask` itself when that read is not a decidable operand."""
+        tree, parents = self._tree_parents(rel)
         if tree is None:
             return mask
         nodes = [x for x in ast.walk(tree) if isinstance(x, ast.Attribute) and x.attr == name
                  and isinstance(x.ctx, ast.Load) and x.lineno == line]
         if not nodes:
             return mask
-        operands = []
-        for x in nodes:
-            p = parents.get(id(x))
-            if isinstance(p, ast.Assign) and p.value is x and len(p.targets) == 1 and isinstance(p.targets[0], ast.Name):
-                # `v = self.FLAG` in a function: follow v when every use is an and/or operand
-                v, fn = p.targets[0].id, parents.get(id(p))
-                while fn is not None and not isinstance(fn, FUNC_TYPES):
-                    fn = parents.get(id(fn))
-                if fn is None:
-                    return mask
-                uses = []
-                for y in ast.walk(fn):
-                    if isinstance(y, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and y is not fn and \
-                            any(a.arg == v for a in ast.walk(y.args) if isinstance(a, ast.arg)):
-                        return mask  # shadowed in a nested scope
-                    if isinstance(y, ast.Name) and y.id == v:
-                        if isinstance(y.ctx, ast.Load):
-                            uses.append(y)
-                        elif y is not p.targets[0]:
-                            return mask  # reassigned / deleted elsewhere
-                    if isinstance(y, (ast.Global, ast.Nonlocal)) and v in y.names:
-                        return mask
-                operands += uses
-            else:
-                operands.append(x)
-        nodes = operands
-        saved, self.rel = self.rel, rel
+        ops = self._flag_operands(rel, nodes, 0)
+        if ops is None:
+            return mask
+        saved = self.rel
         try:
             out = 0
-            for x in nodes:
+            for orel, x in ops:
+                self.rel = orel
+                parents = self._tree_parents(orel)[1]
                 p = parents.get(id(x))
                 if isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not):
                     x, p = p, parents.get(id(p))
@@ -2068,13 +2336,194 @@ class Selector:
                     return mask
                 flipped = x.operand if isinstance(x, ast.UnaryOp) else ast.UnaryOp(op=ast.Not(), operand=x)
                 nb = ast.BoolOp(op=p.op, values=[flipped if v is x else v for v in p.values])
-                r = self.refine_pair(p, nb, parents)
+                r = self.refine_pair(p, nb, parents, ignore_imp=ignore_imp)
                 if r is None:
                     return mask
                 out |= r
             return out
         finally:
             self.rel = saved
+
+    def flag_imp_unchanged(self, rel, line, name):
+        """True when every use of the flag read at rel:line is an and/or operand whose import-time
+        evaluations (any class) all keep their outcome with that operand flipped."""
+        tree, parents = self._tree_parents(rel)
+        if tree is None:
+            return False
+        nodes = [x for x in ast.walk(tree) if isinstance(x, ast.Attribute) and x.attr == name
+                 and isinstance(x.ctx, ast.Load) and x.lineno == line]
+        ops = self._flag_operands(rel, nodes, 0) if nodes else None
+        if ops is None:
+            return False
+        saved = self.rel
+        try:
+            for orel, x in ops:
+                self.rel = orel
+                parents = self._tree_parents(orel)[1]
+                p = parents.get(id(x))
+                if isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not):
+                    x, p = p, parents.get(id(p))
+                if not (isinstance(p, ast.BoolOp) and any(v is x for v in p.values)):
+                    return False
+                flipped = x.operand if isinstance(x, ast.UnaryOp) else ast.UnaryOp(op=ast.Not(), operand=x)
+                nb = ast.BoolOp(op=p.op, values=[flipped if v is x else v for v in p.values])
+                if self.refine_pair(p, nb, parents) is None:
+                    return False
+            return True
+        finally:
+            self.rel = saved
+
+    def _flag_operands(self, rel, nodes, depth):
+        """Where the flag's value can flow: [(rel, node)] of the expressions that hold it, through
+        `v = <read>` locals and a keyword argument stored as `self.A = param` by the callee's
+        __init__; None when it may go anywhere else."""
+        tree, parents = self._tree_parents(rel)
+        out = []
+        for x in nodes:
+            p = parents.get(id(x))
+            if isinstance(p, ast.Assign) and p.value is x and len(p.targets) == 1 and isinstance(p.targets[0], ast.Name):
+                uses = self._local_uses(p, parents)
+                if uses is None:
+                    return None
+                out += [(rel, u) for u in uses]
+            elif isinstance(p, ast.keyword) and p.arg and isinstance(parents.get(id(p)), ast.Call) and depth == 0:
+                flow = self._kwarg_flow(parents.get(id(p)), p.arg)
+                if flow is None:
+                    return None
+                rel2, loads = flow
+                sub = self._flag_operands(rel2, loads, depth + 1)
+                if sub is None:
+                    return None
+                out += sub
+            else:
+                out.append((rel, x))
+        return out
+
+    @staticmethod
+    def _local_uses(assign, parents):
+        """Loads of the local `assign` binds, when that is its only binding in the function."""
+        v, fn = assign.targets[0].id, parents.get(id(assign))
+        while fn is not None and not isinstance(fn, FUNC_TYPES):
+            fn = parents.get(id(fn))
+        if fn is None:
+            return None
+        uses = []
+        for y in ast.walk(fn):
+            if isinstance(y, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and y is not fn and \
+                    any(a.arg == v for a in ast.walk(y.args) if isinstance(a, ast.arg)):
+                return None  # shadowed in a nested scope
+            if isinstance(y, ast.arg) and y.arg == v:
+                return None  # also a parameter
+            if isinstance(y, ast.Name) and y.id == v:
+                if isinstance(y.ctx, ast.Load):
+                    uses.append(y)
+                elif y is not assign.targets[0]:
+                    return None  # reassigned / deleted elsewhere
+            if isinstance(y, (ast.Global, ast.Nonlocal)) and v in y.names:
+                return None
+        return uses
+
+    def _kwarg_flow(self, call, arg):
+        """`Cls(..., arg=<flag>)` where Cls.__init__ only stores the parameter as self.A and A
+        appears nowhere else but as self.A loads in Cls: (rel of Cls, those loads)."""
+        c = chain(call.func)
+        if not c:
+            return None
+        cands = [ck for ck in self.idx["classes"] if ck.split(":", 1)[1] == c[-1]]
+        if len(cands) != 1:
+            return None
+        rel2 = cands[0].split(":", 1)[0].replace(".", "/") + ".py"
+        if self.read_src(rel2) is None:
+            return None
+        tree, parents = self._tree_parents(rel2)
+        if tree is None:
+            return None
+        cls = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == c[-1]]
+        if len(cls) != 1:
+            return None
+        cls = cls[0]
+        if any(isinstance(n, ast.FunctionDef) and n.name in ("__setattr__", "__getattr__", "__getattribute__")
+               for n in cls.body):
+            return None
+        init = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"]
+        if len(init) != 1:
+            return None
+        init = init[0]
+        params = [a.arg for a in init.args.posonlyargs + init.args.args + init.args.kwonlyargs]
+        if arg not in params:
+            return None
+        uses = [y for y in ast.walk(init) if isinstance(y, ast.Name) and y.id == arg]
+        if len(uses) != 1 or not isinstance(uses[0].ctx, ast.Load):
+            return None
+        st = parents.get(id(uses[0]))
+        if not (isinstance(st, ast.Assign) and st.value is uses[0] and len(st.targets) == 1
+                and isinstance(st.targets[0], ast.Attribute) and isinstance(st.targets[0].value, ast.Name)
+                and st.targets[0].value.id == "self" and parents.get(id(st)) is init):
+            return None
+        A = st.targets[0].attr
+        loads = []
+        for y in ast.walk(tree):
+            if isinstance(y, ast.Attribute) and y.attr == A:
+                if y is st.targets[0]:
+                    continue
+                if not (isinstance(y.ctx, ast.Load) and isinstance(y.value, ast.Name) and y.value.id == "self"
+                        and cls.lineno <= y.lineno <= cls.end_lineno):
+                    return None
+                loads.append(y)
+        # the name may appear in this file only as those loads, the store, parameters, names, keyword
+        # arguments and string constants (__slots__); elsewhere only as keywords of Cls(...) calls
+        pat = re.compile(r"\b%s\b" % re.escape(A))
+        n2 = len(pat.findall(self.read_src(rel2)))
+        known = len(loads) + 1 + sum(1 for y in ast.walk(tree) if isinstance(y, ast.arg) and y.arg == A) + \
+            sum(1 for y in ast.walk(tree) if isinstance(y, ast.Name) and y.id == A) + \
+            sum(1 for y in ast.walk(tree) if isinstance(y, ast.Constant) and y.value == A) + \
+            sum(1 for y in ast.walk(tree) if isinstance(y, ast.keyword) and y.arg == A)
+        # inside __init__ the parameter has exactly one use (checked above); same-named locals of
+        # other methods are separate variables, and their loads of self.A are among `loads`
+        names_ok = all(y is uses[0] for y in ast.walk(init) if isinstance(y, ast.Name) and y.id == A)
+        if n2 != known or not names_ok or not self._name_only_as_kwarg(A, c[-1], rel2):
+            return None
+        return rel2, loads
+
+    def _name_only_as_kwarg(self, A, cls_name, rel2):
+        """A appears in no other sqlglot/tests source except as keyword arguments of cls_name(...)."""
+        key = ("kwonly", A, cls_name)
+        cache = self.idx.setdefault("_kwonly_cache", {})
+        if key in cache:
+            return cache[key]
+        pat = re.compile(r"\b%s\b" % re.escape(A))
+        ok = True
+        for root in ("sqlglot", "tests"):
+            for dp, _, fs in os.walk(SRC / root):
+                for fn in fs:
+                    if not fn.endswith(".py"):
+                        continue
+                    rel = (Path(dp) / fn).relative_to(SRC).as_posix()
+                    if rel == rel2:
+                        continue
+                    text = self.read_src(rel)
+                    if text is None:
+                        ok = False
+                        break
+                    if A not in text:
+                        continue
+                    k = len(pat.findall(text))
+                    try:
+                        t = ast.parse(text)
+                    except SyntaxError:
+                        ok = False
+                        break
+                    kw = sum(1 for y in ast.walk(t) if isinstance(y, ast.Call)
+                             and (chain(y.func) or [""])[-1] == cls_name for w in y.keywords if w.arg == A)
+                    if k != kw:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if not ok:
+                break
+        cache[key] = ok
+        return ok
 
     @staticmethod
     def dict_key_match(k):
@@ -2284,12 +2733,20 @@ class Selector:
         self.new_modules = {module_name(f["new"]) for f in files if f["new"] and f["new"].endswith(".py")}
         self.changed = {f["old"] or f["new"] for f in files} | {f["new"] or f["old"] for f in files}
         self.pending_imports = set()
+        self.pending_state = []  # fallback masks of import-time changes, if the state diff cannot run
         self.patched = {}
         # free-rider tiers: later shared-pool tests, near lines, enclosing unit, module users
         self.plausible = [0, 0, 0, 0]
         mask = 0
         for f in files:
             mask |= self.file_change(f)
+        if self.pending_state:
+            readers = self.state_readers()
+            if readers is None:
+                for fb in self.pending_state:
+                    mask |= fb
+            else:
+                mask |= readers
         if self.pending_imports:
             failed = self.check_imports()
             why.append(f"import check {sorted(self.pending_imports)[:3]} -> failed {failed[:3]}")
