@@ -2186,11 +2186,16 @@ def tpcds_hash(overlay):
 def tpcds_skippable(sel):
     """True only if the patch is plain edits of sqlglot/*.py outside the executor/planner and the
     proxy dump is identical to the pristine one."""
-    changed = set(sel.changed)
-    if not changed or changed != set(sel.patched):
+    changed = {rel for rel in sel.changed if rel}
+    if not changed:
         return False
     for rel in changed:
-        if not (rel.startswith("sqlglot/") and rel.endswith(".py")):
+        if rel.startswith("tests/fixtures/") and not rel.endswith(".py"):
+            # data the test never opens (setUpClass reads only tpc-ds/ and tpc-h/)
+            if rel.startswith(("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/")):
+                return False
+            continue
+        if not (rel.startswith("sqlglot/") and rel.endswith(".py")) or rel not in sel.patched:
             return False
         if rel.startswith("sqlglot/executor/") or rel == "sqlglot/planner.py":
             return False
