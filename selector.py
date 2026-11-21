@@ -2459,6 +2459,7 @@ def _same_tree(old, new):
 def tpcds_skippable(sel, budget=0.0):
     """True only if every change can reach test_execute_tpcds only through what the proxy compares,
     and the proxy dump of the patched source is identical to the pristine one."""
+    sel.probe_h = 0
     base = sel.idx.get("tpcds_base")
     if not base or not sel.idx.get("tpcds_phase"):
         return False
@@ -2524,6 +2525,7 @@ def tpcds_skippable(sel, budget=0.0):
         if est > budget:
             why.append(f"tpcds check: executing {len(qs) if qs is not None else 'all'} queries would cost "
                        f"{est:.1f} s > {budget:.1f} s")
+            sel.probe_h = 3  # PROBE H: execution proof skipped for its budget
             return False
         why.append(f"tpcds check: execute {'all' if qs is None else len(qs)} queries")
     else:
@@ -2533,6 +2535,12 @@ def tpcds_skippable(sel, budget=0.0):
                      limit=TPCDS_MARGIN_S + max(budget, 0), exec_all=exec_all, exec_set=qs)
     why.append("tpcds check: " + (f"same rows, executed {v.get('executed')}" if v.get("ok") else v.get("why", "?"))
                + f" ({v.get('cpu')} s)")
+    if exec_all and not v.get("ok"):
+        # PROBE H: why did the execution proof decline? duckdb SQL changed -> 1, different rows -> 2,
+        # slow / CPU limit / timeout / too many -> 3, crash or anything else -> 4
+        r = v.get("why", "")
+        sel.probe_h = 1 if "duckdb reference SQL changed" in r else 2 if "different rows" in r else 3 if any(
+            s in r for s in ("slower", "CPU limit", "Timeout", "too many", "loading its tables")) else 4
     return bool(v.get("ok"))
 
 
@@ -2913,6 +2921,7 @@ def main():
     for patch in patches:
         chosen = everything
         tiers = []
+        markers = 0
         if sel is not None:
             try:
                 text = patch.read_text(encoding="utf-8", errors="replace")
@@ -2931,6 +2940,11 @@ def main():
                                 tpcds_skippable(sel, min(TPCDS_EXEC_CAP_S, saving / 1000 - TPCDS_MARGIN_S)):
                             chosen = [n for n in chosen if n != tp]
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
+                        elif getattr(sel, "probe_h", 0):
+                            # PROBE H (measurement only): drop anyway, mark the reason
+                            markers = sel.probe_h
+                            chosen = [n for n in chosen if n != tp]
+                            why.append(f"PROBE H: execution proof declined ({markers}); dropped, {markers} markers")
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
                 if VERIFY_ON and chosen and time.monotonic() - started < VERIFY_BUDGET_S \
@@ -2965,6 +2979,14 @@ def main():
         except Exception as e:
             log(patch.stem, "free riders failed:", repr(e))
             workers = pack(chosen, durations)
+        if markers:
+            used = {n for w in workers for n in w}
+            spare = sorted((n for n in everything if n not in used), key=lambda n: durations[n])
+            top = max((sum(durations[n] for n in w) for w in workers if w), default=0)
+            for n in spare[:max(0, min(markers, MAX_WORKERS - len([w for w in workers if w])))]:
+                if durations[n] <= max(top, 5):
+                    workers.append([n])
+            log(patch.stem, "PROBE H markers:", len([w for w in workers if w]), "workers")
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     if zyg is not None:
         zyg.close()
