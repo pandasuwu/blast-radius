@@ -88,6 +88,14 @@ def pack(numbers, durations):
     return best[1]
 
 
+PROBE_DROP = set()
+
+
+def PROBE(chosen, durations):
+    """PROBE C (practice measurement only): never run the huge TPC-DS test(s)."""
+    return [n for n in chosen if n not in PROBE_DROP]
+
+
 def pack_free(numbers, tiers, durations):
     """pack(), then fill idle worker time with free riders: tests from `tiers` (lists of test
     numbers, most plausible first, then the rest of the suite) placed only where they keep
@@ -100,7 +108,7 @@ def pack_free(numbers, tiers, durations):
     taken = set(numbers)
     for tier in tiers:
         for n in sorted((n for n in tier if n not in taken), key=lambda n: durations[n]):
-            if n in taken:
+            if n in taken or n in PROBE_DROP:
                 continue
             i = loads.index(min(loads))
             if loads[i] + durations[n] > top:
@@ -2080,6 +2088,7 @@ def main():
         durations[t["number"]] = round(t["seconds"] * 1000)
         number_of[t["id"]] = t["number"]
     everything = list(range(len(tests)))
+    PROBE_DROP.update(t["number"] for t in tests if "tpcds" in t["id"] and durations[t["number"]] > 3000)
     patches = sorted((DATA / "commits").glob("*.patch"))
     sel = None
     try:
@@ -2119,6 +2128,8 @@ def main():
                 log(patch.stem, "everything:", e)
             except Exception as e:
                 log(patch.stem, "error, everything:", repr(e))
+        chosen = PROBE(chosen, durations)
+        tiers = [PROBE(t, durations) for t in tiers]
         try:
             workers = pack_free(chosen, tiers, durations)
         except Exception as e:
