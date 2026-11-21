@@ -2401,6 +2401,8 @@ def tpcds_skippable(sel, budget=0.0):
     if not base or not sel.idx.get("tpcds_phase"):
         return False
     why = sel.why
+    probe_k = 0
+    sel.probe_markers = 0
     for f in sel.files:
         rel = f["new"] or f["old"]
         if f["binary"] or not f["old"] or not f["new"] or f["old"] != f["new"]:
@@ -2416,13 +2418,22 @@ def tpcds_skippable(sel, budget=0.0):
         _, regions = apply_hunks(old, f["hunks"])
         for oa, ob, _na, _nb in regions:
             if not tpcds_region_ok(sel, rel, tree, oa, ob, why):
-                return False
+                # PROBE E (measurement only): v5.2.1's rule only forbids executor/ and planner.py;
+                # check anyway and remember which v5.5 guard refused (1, 2, 3 -> 2, 4, 6 markers)
+                if rel.startswith("sqlglot/executor/") or rel == "sqlglot/planner.py":
+                    return False
+                msg = why[-1] if why else ""
+                probe_k = max(probe_k, 1 if "runs in the uncompared phase" in msg
+                              else 2 if " is used in the uncompared phase" in msg else 3)
     # a patch can make the optimizer very slow: cap the check's wall clock (a timeout keeps the test)
     v, _ = tpcds_run({str(SRC / rel): text for rel, text in sel.patched.items()}, sel.idx["tpcds_ref"],
                      budget, timeout=TPCDS_MARGIN_S + max(budget, 0) + TPCDS_SLACK_S,
                      limit=TPCDS_MARGIN_S + max(budget, 0))
     why.append("tpcds check: " + (f"same rows, executed {v.get('executed')}" if v.get("ok") else v.get("why", "?"))
                + f" ({v.get('cpu')} s)")
+    if v.get("ok") and probe_k:
+        sel.probe_markers = 2 * probe_k
+        why.append(f"PROBE E: guard {probe_k} overridden, {2 * probe_k} marker workers")
     return bool(v.get("ok"))
 
 
@@ -2800,6 +2811,7 @@ def main():
     for patch in patches:
         chosen = everything
         tiers = []
+        markers = 0
         if sel is not None:
             try:
                 text = patch.read_text(encoding="utf-8", errors="replace")
@@ -2816,6 +2828,7 @@ def main():
                             why.append("tpcds proxy: time budget spent")
                         elif tpcds_skippable(sel, min(TPCDS_EXEC_CAP_S, saving / 1000 - TPCDS_MARGIN_S)):
                             chosen = [n for n in chosen if n != tp]
+                            markers = getattr(sel, "probe_markers", 0)
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
@@ -2851,6 +2864,14 @@ def main():
         except Exception as e:
             log(patch.stem, "free riders failed:", repr(e))
             workers = pack(chosen, durations)
+        if markers:
+            used = {n for w in workers for n in w}
+            spare = sorted((n for n in everything if n not in used), key=lambda n: durations[n])
+            top = max((sum(durations[n] for n in w) for w in workers if w), default=0)
+            for n in spare[:max(0, min(markers, MAX_WORKERS - len([w for w in workers if w])))]:
+                if durations[n] <= max(top, 5):
+                    workers.append([n])
+            log(patch.stem, "PROBE E markers:", len([w for w in workers if w]), "workers")
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     if zyg is not None:
         zyg.close()
