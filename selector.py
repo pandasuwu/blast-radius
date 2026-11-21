@@ -2155,7 +2155,12 @@ def digest(x):
 
 
 def load_table(name):
-    """tests/test_executor.py TestExecutor.setUpClass, for one TPC-DS table."""
+    """tests/test_executor.py TestExecutor.setUpClass for one TPC-DS table, then the pickle round
+    trip it makes once as the pool's initargs."""
+    return pickle.loads(pickle.dumps(_load_table(name)))
+
+
+def _load_table(name):
     columns = TPCDS_SCHEMA[name]
     fn = f"{FIXTURES_DIR}/optimizer/tpc-ds/{name}.csv.gz"
     with open(fn, "rb") as f:
@@ -2200,7 +2205,7 @@ def loose_digest(table):
 
 def run(e, names, tables):
     t = time.process_time()
-    tabs = pickle.loads(pickle.dumps({n: tables[n] for n in names}))  # pool initargs + per-query dict
+    tabs = {n: tables[n] for n in names}  # mp_execute picks them out of the initargs dict
     r = pickle.loads(pickle.dumps(execute(e, schema=TPCDS_SCHEMA, tables=tabs)))
     return (result_digest(r), loose_digest(r)), time.process_time() - t
 
@@ -2228,7 +2233,10 @@ for i, (meta, sql, _) in enumerate(sqls):
     names = sorted({t.name for t in find_tables(e)})
     duck = hashlib.sha256(transpile(sql, write="duckdb")[0].encode()).hexdigest()[:20]
     blob = pickle.dumps(e)  # execute() gets the unpickled tree, before optimize() touches it
-    opt = digest(optimize(e, ensure_schema(TPCDS_SCHEMA), leave_tables_isolated=True, dialect=None))
+    will_run = REF is not None and EXEC_ALL and (EXEC_SET is None or i in EXEC_SET)
+    # execute() optimizes again and its rows are compared: no need to compare the tree first
+    opt = None if will_run else digest(optimize(e, ensure_schema(TPCDS_SCHEMA), leave_tables_isolated=True,
+                                                dialect=None))
     parts.append([names, duck, opt])
     if REF is None:
         todo.append((i, blob, names))
@@ -2236,7 +2244,7 @@ for i, (meta, sql, _) in enumerate(sqls):
     ref = REF["parts"][i]
     if ref is None or duck != ref[1]:
         verdict(ok=False, why=f"query {i}: duckdb reference SQL changed")
-    if (EXEC_ALL and (EXEC_SET is None or i in EXEC_SET)) or names != ref[0] or opt != ref[2]:
+    if will_run or names != ref[0] or opt != ref[2]:
         # changed tree or tables, or changed execution code: execute it now (as the test's pool
         # child does) and compare rows
         est += REF["sec"][str(i)]

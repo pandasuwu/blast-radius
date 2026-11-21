@@ -7,6 +7,7 @@ check (a guard refused it), run the check with exec_all=True and compare with th
 false pass = "same rows" although TPC-DS fails in the suite (would be a miss).
 """
 import json
+import os
 import re
 import sys
 import time
@@ -26,7 +27,7 @@ agg = {}
 for s in D:
     ans = json.load(open(A[s]))["commits"]
     logs = {}
-    for line in open(f"/w/work/cmp/cur_{s}.log", encoding="utf-8", errors="replace"):
+    for line in open(f"/w/work/cmp/{os.environ.get('BR_LOGS', 'cur')}_{s}.log", encoding="utf-8", errors="replace"):
         logs.setdefault(line.split(" ", 1)[0], []).append(line)
     for line in open(f"/w/work/cmp/v5_{s}.jsonl"):
         r = json.loads(line)
