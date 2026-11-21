@@ -2426,6 +2426,329 @@ def tpcds_skippable(sel, budget=0.0):
     return bool(v.get("ok"))
 
 
+# Runtime verification of small selections (v5.7). The rules allow running sqlglot's tests while
+# deciding (the CPU is charged). VERIFY_RUN runs the selected tests, in suite order, against the
+# patched source, the way pytest would judge them: a failure, error, failed subtest, unexpected
+# success or unimportable test module fails a test; skips pass. It stops at the first failure.
+VERIFY_RUN = r"""
+import contextlib, importlib, importlib.util, importlib._bootstrap_external as be, io, json, os, sys, unittest
+d = json.load(sys.stdin)
+ov = {os.path.realpath(k): v.encode("utf-8") for k, v in d["overlay"].items()}
+_orig = be.FileLoader.get_data
+def _get_data(self, path):
+    rp = os.path.realpath(path)
+    if rp.endswith(".pyc"):
+        try:
+            src_rp = os.path.realpath(importlib.util.source_from_cache(path))
+        except Exception:
+            raise OSError("unknown bytecode: compile from source")
+        if src_rp in ov:
+            raise OSError("bytecode of a patched file: compile from source")
+    return ov[rp] if rp in ov else _orig(self, path)
+be.FileLoader.get_data = _get_data
+os.chdir(d["src"])
+sys.path.insert(0, d["src"])
+os.environ["SKIP_INTEGRATION"] = "0"
+
+class Result(unittest.TestResult):
+    def __init__(self):
+        super().__init__()
+        self.bad = None
+    def _fail(self, test, kind):
+        if self.bad is None:
+            self.bad = (getattr(test, "id", lambda: str(test))(), kind)
+        self.stop()
+    def addError(self, test, err): self._fail(test, "error")
+    def addFailure(self, test, err): self._fail(test, "failure")
+    def addUnexpectedSuccess(self, test): self._fail(test, "unexpected success")
+    def addSubTest(self, test, subtest, err):
+        if err is not None:
+            self._fail(test, "subtest")
+
+out = {"ok": False}
+sink = io.StringIO()
+try:
+    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+        suite = unittest.TestSuite()
+        for tid in d["ids"]:
+            path, cls, meth = tid.split("::")
+            mod = importlib.import_module(path[:-3].replace("/", "."))
+            suite.addTest(getattr(mod, cls)(meth))
+        res = Result()
+        suite.run(res)
+    out = {"ok": res.bad is None, "bad": res.bad, "ran": res.testsRun}
+except BaseException as e:
+    out = {"ok": False, "bad": ["import", repr(e)[:200]]}
+print("VERIFY " + json.dumps(out))
+"""
+
+
+def verify_run(overlay, ids, timeout=30):
+    """Run test ids (file::Class::method, suite order) on the patched source; {"ok": bool, ...}."""
+    import subprocess
+    try:
+        p = subprocess.run([sys.executable, "-I", "-B", "-c", VERIFY_RUN], cwd=str(SRC),
+                           input=json.dumps({"src": str(SRC), "overlay": overlay, "ids": ids}),
+                           capture_output=True, text=True, timeout=timeout,
+                           env={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "PATH": os.environ.get("PATH", ""),
+                                "SKIP_INTEGRATION": "0"})
+        v = [json.loads(l[7:]) for l in p.stdout.splitlines() if l.startswith("VERIFY ")]
+        return v[-1] if v and p.returncode == 0 else {"ok": False, "bad": ["crash", p.stderr[-200:]]}
+    except Exception as e:
+        return {"ok": False, "bad": ["runner", repr(e)]}
+
+
+# Warm verifier (v5.7). A cold interpreter costs ~0.6 s CPU per check (sqlglot + every dialect come
+# in with tests.dialects.test_dialect), more than a check is worth (~0.43 s expected saving). So one
+# warm process imports sqlglot and every test module that needs no third-party package once, the
+# way pytest's collection does, and forks a child per commit. The child swaps the patched code of
+# the changed functions in (func.__code__), runs the selected tests in suite order, and reports
+# through a pipe. Only patches whose every change sits inside the body of a plain top-level function
+# or method, in lines that never run at import, are handled this way; anything else is not verified.
+ZYGOTE = r"""
+import contextlib, io, json, os, sys, types, unittest
+src = sys.argv[1]
+os.chdir(src)
+sys.path.insert(0, src)
+os.environ["SKIP_INTEGRATION"] = "0"
+mods = json.loads(sys.argv[2])
+sink = io.StringIO()
+with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+    import importlib
+    loaded = {}
+    for m in mods:
+        try:
+            loaded[m] = importlib.import_module(m)
+        except BaseException:
+            pass
+print("READY", flush=True)
+
+
+class Result(unittest.TestResult):
+    def __init__(self):
+        super().__init__()
+        self.bad = None
+    def _fail(self, test, kind):
+        if self.bad is None:
+            self.bad = (getattr(test, "id", lambda: str(test))(), kind)
+        self.stop()
+    def addError(self, test, err): self._fail(test, "error")
+    def addFailure(self, test, err): self._fail(test, "failure")
+    def addUnexpectedSuccess(self, test): self._fail(test, "unexpected success")
+    def addSubTest(self, test, subtest, err):
+        if err is not None:
+            self._fail(test, "subtest")
+
+
+def find_code(code, qualname):
+    for c in code.co_consts:
+        if isinstance(c, types.CodeType):
+            if c.co_qualname == qualname:
+                return c
+            r = find_code(c, qualname)
+            if r is not None:
+                return r
+    return None
+
+
+def live_function(module, qualname):
+    obj = module
+    parts = qualname.split(".")
+    for p in parts[:-1]:
+        obj = obj.__dict__.get(p) if isinstance(obj, (type, types.ModuleType)) else None
+        if not isinstance(obj, type):
+            return None
+    f = obj.__dict__.get(parts[-1]) if isinstance(obj, (type, types.ModuleType)) else None
+    if isinstance(f, (staticmethod, classmethod)):
+        f = f.__func__
+    if not isinstance(f, types.FunctionType) or f.__code__.co_qualname != qualname:
+        return None
+    return f
+
+
+def install_overlay(overlay):
+    import importlib.util, importlib._bootstrap_external as be
+    ov = {os.path.realpath(k): v.encode("utf-8") for k, v in overlay.items()}
+    orig = be.FileLoader.get_data
+    def get_data(self, path):
+        rp = os.path.realpath(path)
+        if rp.endswith(".pyc"):
+            try:
+                src_rp = os.path.realpath(importlib.util.source_from_cache(path))
+            except Exception:
+                raise OSError("unknown bytecode")
+            if src_rp in ov:
+                raise OSError("bytecode of a patched file")
+        return ov[rp] if rp in ov else orig(self, path)
+    be.FileLoader.get_data = get_data
+
+
+def child(req):
+    if req.get("reload") is not None:
+        # import-time change in a leaf module: re-execute it and every module that imports it, then
+        # the test modules, in their original import order, with the patched sources swapped in
+        install_overlay(req["overlay"])
+        want = set(req["reload"]) | {i.split("::")[0][:-3].replace("/", ".") for i in req["ids"]}
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            for name in [m for m in list(sys.modules) if m in want]:
+                importlib.reload(sys.modules[name])
+    for ch in req.get("changes", ()):
+        mod = sys.modules.get(ch["module"])
+        if mod is None:
+            return {"ok": False, "bad": ["swap", "module not loaded " + ch["module"]]}
+        code = compile(ch["source"], mod.__file__, "exec")
+        for q in ch["functions"]:
+            new, f = find_code(code, q), live_function(mod, q)
+            if new is None or f is None or new.co_freevars != f.__code__.co_freevars:
+                return {"ok": False, "bad": ["swap", q]}
+            f.__code__ = new
+    suite = unittest.TestSuite()
+    for tid in req["ids"]:
+        path, cls, meth = tid.split("::")
+        m = sys.modules.get(path[:-3].replace("/", "."))
+        if m is None:
+            return {"ok": False, "bad": ["not loaded", path]}
+        suite.addTest(getattr(m, cls)(meth))
+    res = Result()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        suite.run(res)
+    return {"ok": res.bad is None, "bad": res.bad, "ran": res.testsRun}
+
+
+for line in sys.stdin:
+    req = json.loads(line)
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            out = child(req)
+        except BaseException as e:
+            out = {"ok": False, "bad": ["child", repr(e)[:200]]}
+        os.write(w, json.dumps(out).encode())
+        os._exit(0)
+    os.close(w)
+    data = b""
+    while True:
+        b = os.read(r, 65536)
+        if not b:
+            break
+        data += b
+    os.close(r)
+    os.waitpid(pid, 0)
+    print("VERIFY " + (data.decode() or json.dumps({"ok": False, "bad": ["child died"]})), flush=True)
+"""
+VERIFY_MAX_COST_MS = 6000  # only selections this cheap are worth verifying (~2 s saved when all pass)
+VERIFY_HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")  # third-party deps, shared pools
+VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET", "140"))  # wall clock since start
+
+
+class Zygote:
+    """The warm verifier process; started at the first commit that needs it."""
+
+    def __init__(self, test_files):
+        import subprocess
+        mods = [f[:-3].replace("/", ".") for f in test_files if f not in VERIFY_HEAVY]
+        self.p = subprocess.Popen([sys.executable, "-I", "-c", ZYGOTE, str(SRC), json.dumps(mods)],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  text=True, cwd=str(SRC),
+                                  env={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "SKIP_INTEGRATION": "0",
+                                       "PATH": os.environ.get("PATH", "")})
+        self.ok = self._readline(60) == "READY"
+
+    def _readline(self, timeout):
+        import select
+        r, _, _ = select.select([self.p.stdout], [], [], timeout)
+        return self.p.stdout.readline().strip() if r else None
+
+    def check(self, changes, ids, timeout=20, reload=None, overlay=None):
+        if not self.ok:
+            return {"ok": False, "bad": ["zygote down"]}
+        try:
+            req = {"changes": changes or [], "ids": ids}
+            if reload is not None:
+                req.update(reload=reload, overlay=overlay)
+            self.p.stdin.write(json.dumps(req) + "\n")
+            self.p.stdin.flush()
+            line = self._readline(timeout)
+        except Exception as e:
+            line, self.ok = None, False
+            log("zygote:", repr(e))
+        if not line or not line.startswith("VERIFY "):
+            self.ok = False  # a hung child keeps the pipe busy: stop using the zygote
+            self.close()
+            return {"ok": False, "bad": ["timeout"]}
+        return json.loads(line[7:])
+
+    def close(self):
+        try:
+            self.p.kill()
+        except Exception:
+            pass
+
+
+RELOAD_MAX_MODULES = 40  # a leaf module and its importers (subclassing dialects); core modules have ~240
+
+
+def reload_plan(sel):
+    """(modules to re-execute, overlay) for a patch of existing sqlglot/*.py files whose modules and
+    their transitive importers are few (leaf modules such as one dialect's tokenizer, parser or
+    generator); None otherwise."""
+    changed, overlay = set(), {}
+    for f in sel.files:
+        rel = f["new"] or f["old"]
+        if f["binary"] or not f["old"] or f["old"] != f["new"] or not rel.startswith("sqlglot/") \
+                or not rel.endswith(".py") or rel not in sel.patched:
+            return None
+        changed.add(module_name(rel))
+        overlay[str(SRC / rel)] = sel.patched[rel]
+    closure, stack = set(), list(changed)
+    while stack:
+        m = stack.pop()
+        if m in closure:
+            continue
+        closure.add(m)
+        if len(closure) > RELOAD_MAX_MODULES:
+            return None
+        stack.extend(sel.idx["rdeps"].get(m, ()))
+    return sorted(closure), overlay
+
+
+def swappable_changes(sel):
+    """[{module, source, functions}] when every change of the patch is inside the body of a plain
+    top-level function or method (not nested, not a header or decorator) in lines that never run
+    at import; None otherwise."""
+    out = []
+    for f in sel.files:
+        rel = f["new"] or f["old"]
+        if f["binary"] or not f["old"] or f["old"] != f["new"] or not rel.startswith("sqlglot/") \
+                or not rel.endswith(".py") or rel not in sel.patched:
+            return None
+        old = sel.read_src(rel)
+        tree = ast.parse(old)
+        il = set(sel.idx["importlines"].get(rel, ()))
+        _, regions = apply_hunks(old, f["hunks"])
+        names = set()
+        for oa, ob, _na, _nb in regions:
+            lo, hi = (oa, ob) if ob >= oa else (max(ob, 1), oa)
+            if any(x in il for x in range(lo, hi + 1)):
+                return None
+            chain = _stmt_chain(tree, lo, hi)
+            funcs = [i for i, s in enumerate(chain) if isinstance(s, FUNC_TYPES)]
+            if len(funcs) != 1 or any(not isinstance(s, ast.ClassDef) for s in chain[:funcs[0]]):
+                return None  # not in a function, or in a nested one / one inside control flow
+            fn = chain[funcs[0]]
+            if not fn.body or lo < first_line(fn.body[0]) or fn.decorator_list and \
+                    any(first_line(d) <= hi and lo <= d.end_lineno for d in fn.decorator_list):
+                return None  # header, decorator or docstring position
+            if any(isinstance(n, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                   and first_line(n) <= hi and lo <= n.end_lineno for n in ast.walk(fn) if n is not fn):
+                return None  # touches a nested def, lambda or class
+            names.add(".".join(s.name for s in chain[:funcs[0] + 1]))
+        out.append({"module": module_name(rel), "source": sel.patched[rel], "functions": sorted(names)})
+    return out or None
+
+
 def load_index():
     try:
         with open(INDEX, "rb") as fh:
@@ -2472,6 +2795,7 @@ def main():
             i += 1
         return nums
 
+    zyg = None
     out = []
     for patch in patches:
         chosen = everything
@@ -2495,6 +2819,24 @@ def main():
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
+                if chosen and time.monotonic() - started < VERIFY_BUDGET_S \
+                        and plan_cost(pack(chosen, durations), durations) < VERIFY_MAX_COST_MS \
+                        and not any(tests[n]["file"] in VERIFY_HEAVY for n in chosen):
+                    try:
+                        changes = swappable_changes(sel)
+                        plan = None if changes else reload_plan(sel)
+                        if changes or plan:
+                            if zyg is None:
+                                zyg = Zygote(sorted({t["file"] for t in tests}))
+                            ids = [tests[n]["id"] for n in sorted(chosen)]
+                            v = zyg.check(changes, ids) if changes else zyg.check(None, ids, reload=plan[0],
+                                                                                  overlay=plan[1])
+                            why.append("verify: " + ("all pass, nothing to run" if v.get("ok")
+                                                     else str(v.get("bad"))[:80]))
+                            if v.get("ok"):
+                                chosen = []
+                    except Exception as e:
+                        log(patch.stem, "verify error:", repr(e))
                 try:
                     tiers = [numbers(m) for m in getattr(sel, "plausible", ())] + [everything]
                 except Exception as e:
@@ -2510,6 +2852,8 @@ def main():
             log(patch.stem, "free riders failed:", repr(e))
             workers = pack(chosen, durations)
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
+    if zyg is not None:
+        zyg.close()
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
 
