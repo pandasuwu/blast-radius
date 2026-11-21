@@ -389,6 +389,17 @@ def build_index():
         "testfiles": {k: sets[v] for k, v in m["testfiles"].items()},
         "missing": m.get("missing", []),
     }
+    prof, untrusted = {}, 0
+    pf = APP / "maps" / "prof.json.gz"
+    if pf.exists():
+        p = json.load(gzip.open(pf, "rt"))
+        assert p["tests"] == m["tests"]
+        psets = [int(x, 16) for x in p["sets"]]
+        for rel, nodes in p["nodes"].items():
+            prof[rel] = {tuple(map(int, k.split(","))): (kind, op, imp, [(sig, psets[i]) for sig, i in sigs])
+                         for k, (kind, op, imp, sigs) in nodes.items()}
+        untrusted = int(p["untrusted"], 16)
+    idx["prof"], idx["untrusted"] = prof, untrusted
     trees = {}
     attrnames = set()
     for root in ("sqlglot", "tests"):
@@ -792,21 +803,33 @@ class Selector:
 
     def is_subclass(self, dotted, ck, seen=None):
         """Static check: does the class at `dotted` have class `ck` among its ancestors?"""
+        top = seen is None
+        if top:
+            hit = self.memo.get(("sub", dotted, ck))
+            if hit is not None:
+                return hit
         mod, qual = ck.split(":", 1)
-        target = f"{mod}.{qual}"
-        if dotted == target or dotted.endswith("." + qual):
-            return True
-        seen = seen or set()
-        for k, info in self.idx["classinfo"].items():
-            m2, q2 = k.split(":", 1)
-            if f"{m2}.{q2}" == dotted or (dotted.endswith("." + q2) and dotted.rsplit(".", 1)[-1] == q2.rsplit(".", 1)[-1]):
-                if k in seen:
-                    continue
-                seen.add(k)
-                for b in info[3]:
-                    if self.is_subclass(b, ck, seen):
-                        return True
-        return False
+        if dotted == f"{mod}.{qual}" or dotted.endswith("." + qual):
+            res = True
+        else:
+            res = False
+            seen = seen if seen is not None else set()
+            by_last = self.memo.get("by_last")
+            if by_last is None:
+                by_last = {}
+                for k, info in self.idx["classinfo"].items():
+                    m2, q2 = k.split(":", 1)
+                    by_last.setdefault(q2.rsplit(".", 1)[-1], []).append((k, f"{m2}.{q2}", q2, info[3]))
+                self.memo["by_last"] = by_last
+            for k, full, q2, bases in by_last.get(dotted.rsplit(".", 1)[-1], ()):
+                if (full == dotted or dotted.endswith("." + q2)) and k not in seen:
+                    seen.add(k)
+                    if any(self.is_subclass(b, ck, seen) for b in bases):
+                        res = True
+                        break
+        if top:
+            self.memo[("sub", dotted, ck)] = res
+        return res
 
     def class_attr(self, ck, name, depth=0):
         """Tests that can observe a change of attribute `name` of class `ck`."""
@@ -920,6 +943,10 @@ class Selector:
             return 0, False
         if ctx[0] == "f":
             return self.func_region(O, N, oblock, oa, ob, ctx, parent), True
+        if len(Od) == 1 and len(Nd) == 1:
+            r = self.refine_lambda_only(Od[0], Nd[0])
+            if r is not None:
+                return r, True
         ck = ctx[1] if ctx[0] == "c" else None
         return self.body(Od, Nd, ck), True
 
@@ -937,10 +964,16 @@ class Selector:
                 spans.append((first_line(nxt[0]), nxt[0].end_lineno))
             if not prev and parent is not None:
                 spans.append((first_line(parent), parent.end_lineno))
+        func, owner_ctx = ctx[1], ctx[2]
+        import_time = any(self.is_import_time(rel, a, b) for a, b in spans)
+        if not import_time and len(O) == 1 and len(N) == 1:
+            r = self.refine_stmt(O[0], N[0])
+            if r is not None:
+                self.why.append(f"condition profile in {func.name}")
+                return r
         for a, b in spans:
             m |= self.cover(rel, a, b)
-        func, owner_ctx = ctx[1], ctx[2]
-        if any(self.is_import_time(rel, a, b) for a, b in spans):
+        if import_time:
             ck = owner_ctx[1] if owner_ctx[0] == "c" else None
             self.why.append(f"import-time code in {func.name}")
             m |= self.import_break(self.mod)
@@ -950,6 +983,215 @@ class Selector:
         else:
             self.why.append(f"lines in {func.name}")
         return m
+
+    # --- condition profile (weak mutation) refinement
+    OPNODES = (ast.cmpop, ast.boolop, ast.operator, ast.unaryop, ast.expr_context)
+
+    @staticmethod
+    def expr_diffs(a, b, out, parents, parent=None):
+        """Top-most differing (old, new) node pairs, in one linear pass; records old parents.
+        Returns True when a and b are equal."""
+        if type(a) is not type(b):
+            out.append((a, b))
+            return False
+        parents[id(a)] = parent
+        local = []
+        equal = True
+        here = False
+        for f in a._fields:
+            va, vb = getattr(a, f, None), getattr(b, f, None)
+            if isinstance(va, list) or isinstance(vb, list):
+                va, vb = va or [], vb or []
+                if len(va) != len(vb):
+                    here = True
+                    break
+                for x, y in zip(va, vb):
+                    if isinstance(x, Selector.OPNODES) or isinstance(y, Selector.OPNODES):
+                        if type(x) is not type(y):
+                            here = True
+                    elif isinstance(x, ast.AST) and isinstance(y, ast.AST):
+                        if not Selector.expr_diffs(x, y, local, parents, a):
+                            equal = False
+                    elif x != y:
+                        here = True
+                if here:
+                    break
+            elif isinstance(va, Selector.OPNODES) or isinstance(vb, Selector.OPNODES):
+                if type(va) is not type(vb):
+                    here = True
+                    break
+            elif isinstance(va, ast.AST) or isinstance(vb, ast.AST):
+                if va is None or vb is None or type(va) is not type(vb):
+                    here = True
+                    break
+                if not Selector.expr_diffs(va, vb, local, parents, a):
+                    equal = False
+            elif va != vb:
+                here = True
+                break
+        if here:
+            Selector.note_parents_children(a, parents)
+            out.append((a, b))
+            return False
+        out.extend(local)
+        return equal
+
+    @staticmethod
+    def note_parents_children(node, parents):
+        for c in ast.iter_child_nodes(node):
+            if id(c) not in parents:
+                parents[id(c)] = node
+                Selector.note_parents_children(c, parents)
+
+    def prof_entry(self, node):
+        if not hasattr(node, "end_col_offset"):
+            return None
+        return self.idx["prof"].get(self.rel, {}).get(
+            (node.lineno, node.col_offset, node.end_lineno, node.end_col_offset))
+
+    CMP_FAMILY = {}
+    for _f in (("Eq", "NotEq", "Is", "IsNot"), ("Lt", "LtE", "Gt", "GtE", "Eq", "NotEq")):
+        for _o in _f[:4]:
+            CMP_FAMILY.setdefault(_o, _f)
+
+    def refine_pair(self, a, b, parents):
+        """Tests whose recorded evaluations of old node `a` differ under new node `b`;
+        None when the profile cannot decide."""
+        if a is None or b is None:
+            return None
+        e = self.prof_entry(a)
+        if e is None or e[2]:  # not instrumented, or evaluated at import time
+            return None
+        kind, op, imp, sigs = e
+        if isinstance(a, ast.Compare) and isinstance(b, ast.Compare) and kind == "cmp":
+            if len(a.ops) != 1 or len(b.ops) != 1 or dump(a.left) != dump(b.left) or \
+                    dump(a.comparators[0]) != dump(b.comparators[0]):
+                return self.all_evals(sigs)
+            new = type(b.ops[0]).__name__
+            fam = self.CMP_FAMILY.get(op)
+            if not fam or new not in fam:
+                return self.all_evals(sigs)
+            i, j = fam.index(op), fam.index(new)
+            m = 0
+            for sig, mask in sigs:
+                if len(sig) != len(fam) or sig[i] != sig[j] or "E" in (sig[i], sig[j]):
+                    m |= mask
+            return m
+        if isinstance(a, ast.BoolOp) and kind == "bool":
+            leaves = {dump(v): k for k, v in enumerate(a.values)}
+            if len(leaves) != len(a.values):
+                return self.all_evals(sigs)
+            bool_ctx = self.in_bool_ctx(a, parents)
+
+            def ev(node, vec, used):
+                if isinstance(node, ast.BoolOp):
+                    res = None
+                    for v in node.values:
+                        res = ev(v, vec, used)
+                        t = res[1]
+                        if (isinstance(node.op, ast.And) and not t) or (isinstance(node.op, ast.Or) and t):
+                            return res
+                    return res
+                k = leaves[dump(node)]  # KeyError: an operand the old expression did not have
+                c = vec[k]
+                if c not in "01":
+                    raise KeyError(c)
+                used.append(k)
+                return k, c == "1"
+
+            m = 0
+            for sig, mask in sigs:
+                try:
+                    if "X" in sig or "E" in sig or len(sig) != len(a.values):
+                        raise KeyError(sig)
+                    old_used = [k for k, c in enumerate(sig) if c != "-"]
+                    old_res = old_used[-1]
+                    used = []
+                    k, t = ev(b, sig, used)
+                    same = used == old_used and (t == (sig[old_res] == "1") if bool_ctx else k == old_res)
+                except KeyError:
+                    same = False
+                if not same:
+                    m |= mask
+            return m
+        return None
+
+    @staticmethod
+    def all_evals(sigs):
+        m = 0
+        for _, mask in sigs:
+            m |= mask
+        return m
+
+    @staticmethod
+    def in_bool_ctx(node, parents):
+        p = parents.get(id(node))
+        while True:
+            if isinstance(p, (ast.If, ast.While, ast.IfExp, ast.Assert)) and getattr(p, "test", None) is node:
+                return True
+            if isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not):
+                return True
+            if isinstance(p, ast.comprehension) and any(x is node for x in p.ifs):
+                return True
+            if isinstance(p, ast.BoolOp):
+                node, p = p, parents.get(id(p))
+                continue
+            return False
+
+    def refine_stmt(self, o, n):
+        """Mask for a statement whose only differences are profiled comparisons/boolops."""
+        if type(o) is not type(n):
+            return None
+        pairs, parents = [], {}
+        self.expr_diffs(o, n, pairs, parents)
+        if not pairs:
+            return None
+        m = 0
+        for a, b in pairs:
+            r = self.refine_pair(a, b, parents)
+            if r is None:
+                return None
+            m |= r
+        return m | (self.idx["untrusted"] & self.cover(self.rel, first_line(o), o.end_lineno))
+
+    def refine_lambda_only(self, o, n):
+        """A class/module-level statement whose differences all sit inside lambda bodies only
+        changes what those lambdas do when they are called (at test time)."""
+        if type(o) is not type(n) or not isinstance(o, (ast.Assign, ast.AnnAssign)):
+            return None
+        pairs, parents = [], {}
+        self.expr_diffs(o, n, pairs, parents)
+        if not pairs:
+            return None
+        m = 0
+        for a, b in pairs:
+            lam, x = None, a
+            while x is not None:
+                p = parents.get(id(x))
+                if isinstance(p, ast.Lambda) and p.body is x:
+                    lam = p
+                    break
+                x = p
+            if lam is None:
+                return None
+            pl = parents.get(id(lam))
+            if isinstance(pl, ast.Call) and pl.func is lam:
+                return None  # called right away at import time
+            if self.is_import_time_lambda(lam):
+                return None
+            r = self.refine_pair(a, b, parents)
+            if r is None:
+                r = self.cover(self.rel, lam.lineno, lam.end_lineno)
+            m |= r
+        self.why.append("lambda body only")
+        return m | (self.idx["untrusted"] & self.cover(self.rel, first_line(o), o.end_lineno))
+
+    def is_import_time_lambda(self, lam):
+        for x in ast.walk(lam.body):
+            e = self.prof_entry(x)
+            if e is not None and e[2]:
+                return True
+        return False
 
     @staticmethod
     def key(s):
