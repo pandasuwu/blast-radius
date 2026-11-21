@@ -697,7 +697,9 @@ def build_index():
             for ln in ls:
                 names.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", src_lines[ln - 1]))
         idx["tpcds_phase"] = {"lines": ulines, "classes": set(ph["classes"]), "names": names}
-        idx["tpcds_base"], idx["tpcds_steps"] = tpcds_hash({}, with_steps=True)
+        v, ref = tpcds_run({}, timeout=480)
+        idx["tpcds_ref"] = ref if v.get("ok") and ref else None
+        idx["tpcds_base"] = bool(idx["tpcds_ref"])
     except Exception as e:
         log("tpcds proxy disabled:", repr(e))
         idx["tpcds_base"] = None
@@ -2081,60 +2083,51 @@ class Selector:
         return m
 
 
-# TPC-DS equivalence check (v5.2). test_execute_tpcds (21.5 s) depends on: parse_one of each
-# fixture query, the pickle round trip, find_tables, the duckdb transpile (reference result) and the
-# optimize() inside executor.execute(); then the planner + python executor run the optimized tree.
-# TPCDS_PROXY dumps everything up to and including optimize() exactly. If the patched source gives
-# the same dump as the pristine one and the patch touches no executor/planner code, the test's
-# outcome cannot change. Validated on 82 labelled selections: 0 misses, 54 of 66 passes skipped.
-TPCDS_PROXY = r'''"""Prototype: the parts of test_execute_tpcds that the test's outcome depends on, minus execution.
-
-For every TPC-DS fixture query, in the test's own order: parse_one (parent), the pickle round trip
-to the pool child, transpile to duckdb (parent's reference result), and the optimize() call inside
-executor.execute(). Prints one hash over a full structural dump of all of them.
-usage: PYTHONPATH=<sqlglot checkout> python tools/tpcds_proxy.py
-"""
-import hashlib
-import pickle
-import sys
-import time
-
+# TPC-DS equivalence check (v5.5). test_execute_tpcds (21.5 s): for every TPC-DS fixture query the
+# parent runs parse_one and pickles the tree to a pool child; for queries marked `execute` the child
+# runs executor.execute() (optimize, then Plan + PythonExecutor) on the tables find_tables names, and
+# the parent compares the rows positionally with duckdb running transpile(sql, write="duckdb").
+# TPCDS_CHECK reproduces that up to optimize() for every query and hashes each part. With the patched
+# source swapped in:
+#   * any exception, or a different duckdb SQL for an executed query  -> the test may fail;
+#   * a non-executed query only has to parse and pickle;
+#   * an executed query whose table list and optimized tree are unchanged gets the same rows;
+#   * the others are executed for real and their rows compared with the pristine rows (ref mode,
+#     computed at build time), within a CPU budget.
+# tpcds_region_ok() makes sure the patch cannot change the code that runs outside these calls.
+TPCDS_CHECK = r'''
+import gzip, hashlib, ast as _ast, csv, json, pickle, sys, time
 t0 = time.process_time()
-from sqlglot import exp, find_tables, parse_one, transpile  # noqa: E402
-from sqlglot.optimizer import optimize  # noqa: E402
-from sqlglot.schema import ensure_schema  # noqa: E402
-from tests.helpers import TPCDS_SCHEMA, load_sql_fixture_pairs  # noqa: E402
+from sqlglot import exp, find_tables, parse_one, transpile
+from sqlglot.executor import execute
+from sqlglot.executor.table import Table
+from sqlglot.optimizer import optimize
+from sqlglot.schema import ensure_schema
+from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, load_sql_fixture_pairs
 
 SKIP = {"parent", "_hash"}
 
 
-def dump(x, out, seen=None):
-    """Exact structural dump. Shared or cyclic objects become back-references (#n), so sharing
-    is part of what is compared and nothing is walked twice."""
-    if seen is None:
-        seen = {}
+def dump(x, out, seen):
+    """Exact structural dump; shared or cyclic objects become back-references (#n)."""
     if isinstance(x, (exp.Expr, dict, list, set, frozenset)) or hasattr(x, "__dict__"):
         k = id(x)
         if k in seen:
             out.append("#%d" % seen[k][0])
             return
-        seen[k] = (len(seen), x)  # keep x alive so its id is not reused
+        seen[k] = (len(seen), x)
     if isinstance(x, exp.Expr):
         out.append("<" + type(x).__qualname__)
         slots = [s for c in type(x).__mro__ for s in getattr(c, "__slots__", ())]
-        items = [(s, getattr(x, s, None)) for s in slots] + sorted(getattr(x, "__dict__", {}).items())
-        for k, v in items:
-            if k in SKIP:
-                continue
-            out.append(k + "=")
-            dump(v, out, seen)
+        for k, v in [(s, getattr(x, s, None)) for s in slots] + sorted(getattr(x, "__dict__", {}).items()):
+            if k not in SKIP:
+                out.append(k + "=")
+                dump(v, out, seen)
         out.append(">")
     elif isinstance(x, dict):
         out.append("{")
-        # args insertion order varies run to run in the pinned code itself (id-ordered sets in
-        # the optimizer); generation reads args by name, so compare str-keyed dicts sorted
-        items = sorted(x.items()) if all(type(k) is str for k in x) else x.items()
-        for k, v in items:
+        # args insertion order varies run to run in the pinned code itself; compare sorted
+        for k, v in (sorted(x.items()) if all(type(k) is str for k in x) else x.items()):
             dump(k, out, seen)
             out.append(":")
             dump(v, out, seen)
@@ -2153,34 +2146,97 @@ def dump(x, out, seen=None):
         out.append(type(x).__name__ + ":" + repr(x))
 
 
-h = hashlib.sha256()
-steps = []  # running hash after each query; EXPECT (pristine steps) allows stopping at the first difference
-EXPECT = globals().get("EXPECT")
+def digest(x):
+    out = []
+    dump(x, out, {})
+    return hashlib.sha256("\x00".join(out).encode("utf-8", "surrogatepass")).hexdigest()[:20]
+
+
+def load_table(name):
+    """tests/test_executor.py TestExecutor.setUpClass, for one TPC-DS table."""
+    columns = TPCDS_SCHEMA[name]
+    fn = f"{FIXTURES_DIR}/optimizer/tpc-ds/{name}.csv.gz"
+    with open(fn, "rb") as f:
+        gz = f.read(2) == b"\x1f\x8b"
+    fh = gzip.open(fn, "rt", newline="") if gz else open(fn, encoding="utf-8", newline="")
+    reader = csv.reader(fh, delimiter="|")
+    rows, ctypes = [], []
+    next(reader)
+    for row in reader:
+        if not ctypes:
+            for v in row:
+                try:
+                    ctypes.append(type(_ast.literal_eval(v)))
+                except (ValueError, SyntaxError):
+                    ctypes.append(str)
+        rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+    return Table(columns=columns, rows=rows)
+
+
+def result_digest(table):
+    rows = [tuple((type(v).__name__, v) for v in r) for r in table.rows]
+    return hashlib.sha256(repr((list(table.columns), rows)).encode()).hexdigest()[:20]
+
+
+def run(e, names, tables):
+    t = time.process_time()
+    tabs = pickle.loads(pickle.dumps({n: tables[n] for n in names}))  # pool initargs + per-query dict
+    r = pickle.loads(pickle.dumps(execute(e, schema=TPCDS_SCHEMA, tables=tabs)))
+    return result_digest(r), time.process_time() - t
+
+
+def verdict(**k):
+    k["cpu"] = round(time.process_time() - t0, 2)
+    print("VERDICT " + json.dumps(k), file=sys.stderr)
+    sys.exit(0)
+
+
+REF, BUDGET, LIMIT = globals().get("REF"), globals().get("BUDGET", 0.0), globals().get("LIMIT", 1e9)
 sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
-schema = ensure_schema(TPCDS_SCHEMA)
-n_exec = 0
-for meta, sql, _ in sqls:
-    out, seen = [], {}
-    e = parse_one(sql)
-    dump(e, out, seen)
-    e = pickle.loads(pickle.dumps(e))
-    if meta.get("execute"):
-        n_exec += 1
-        dump(sorted(t.name for t in find_tables(e)), out, seen)
-        out.append(transpile(sql, write="duckdb")[0])
-        dump(optimize(e, ensure_schema(TPCDS_SCHEMA), leave_tables_isolated=True, dialect=None), out, seen)
-    blob = "\x00".join(out).encode("utf-8", "surrogatepass")
-    h.update(blob)
-    steps.append(h.copy().hexdigest()[:16])
-    if EXPECT is not None and (len(EXPECT) < len(steps) or EXPECT[len(steps) - 1] != steps[-1]):
-        print("0" * 64, len(sqls), n_exec, round(time.process_time() - t0, 2), file=sys.stderr)
-        sys.exit(0)
-    if len(sys.argv) > 1:
-        print(hashlib.sha256(blob).hexdigest()[:12], file=sys.stderr)
-        if sys.argv[1] != "1":
-            open(f"{sys.argv[1]}.{n_exec}", "wb").write(blob)
-print("STEPS " + " ".join(steps), file=sys.stderr)
-print(h.hexdigest(), len(sqls), n_exec, round(time.process_time() - t0, 2), file=sys.stderr)
+parts, todo, est, tables = [], [], 0.0, {}
+for i, (meta, sql, _) in enumerate(sqls):
+    if REF is not None and time.process_time() - t0 > LIMIT:
+        verdict(ok=False, why=f"query {i}: CPU limit reached (slow patch?)")
+    e = pickle.loads(pickle.dumps(parse_one(sql)))
+    if not meta.get("execute"):
+        parts.append(None)  # the child returns None for it: parsing and pickling is all that matters
+        continue
+    names = sorted({t.name for t in find_tables(e)})
+    duck = hashlib.sha256(transpile(sql, write="duckdb")[0].encode()).hexdigest()[:20]
+    blob = pickle.dumps(e)  # execute() gets the unpickled tree, before optimize() touches it
+    opt = digest(optimize(e, ensure_schema(TPCDS_SCHEMA), leave_tables_isolated=True, dialect=None))
+    parts.append([names, duck, opt])
+    if REF is None:
+        todo.append((i, blob, names))
+        continue
+    ref = REF["parts"][i]
+    if ref is None or duck != ref[1]:
+        verdict(ok=False, why=f"query {i}: duckdb reference SQL changed")
+    if names != ref[0] or opt != ref[2]:
+        # changed tree or tables: execute it now (as the test's pool child does) and compare rows
+        est += REF["sec"][str(i)]
+        if est > BUDGET:
+            verdict(ok=False, why=f"query {i}: too many changed queries to execute")
+        for n in names:
+            if n not in tables:
+                t1 = time.process_time()
+                tables[n] = load_table(n)
+                est += time.process_time() - t1
+        if est > BUDGET:
+            verdict(ok=False, why=f"query {i}: loading its tables spent the budget")
+        if run(pickle.loads(blob), names, tables)[0] != REF["res"][str(i)]:
+            verdict(ok=False, why=f"query {i}: different rows")
+        todo.append((i, blob, names))
+if REF is None:
+    for n in sorted({n for _, _, ns in todo for n in ns}):
+        tables[n] = load_table(n)
+    res, sec = {}, {}
+    for i, blob, names in todo:
+        res[str(i)], sec[str(i)] = run(pickle.loads(blob), names, tables)
+    print("REF " + json.dumps({"parts": parts, "res": res, "sec": {k: round(v, 3) for k, v in sec.items()}}),
+          file=sys.stderr)
+    verdict(ok=True, ref=True)
+verdict(ok=True, executed=[i for i, _, _ in todo])
 '''
 TPCDS_RUN = r"""
 import json, os, sys, importlib.util, importlib._bootstrap_external as be
@@ -2200,11 +2256,15 @@ def _get_data(self, path):
     return ov[rp] if rp in ov else _orig(self, path)
 be.FileLoader.get_data = _get_data
 sys.path.insert(0, d["src"])
-sys.argv = ["proxy"]
-exec(compile(d["proxy"], "tpcds_proxy", "exec"), {"__name__": "__main__", "EXPECT": d.get("expect")})
+sys.argv = ["tpcds_check"]
+exec(compile(d["code"], "tpcds_check", "exec"), {"__name__": "__main__", "REF": d.get("ref"),
+                                                  "BUDGET": d.get("budget", 0.0), "LIMIT": d.get("limit", 1e9)})
 """
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-TPCDS_MIN_SAVING_MS = 6000  # the proxy costs about 3-4 s of charged CPU
+TPCDS_MIN_SAVING_MS = 6000  # the check costs about 2-3 s of charged CPU before any execution
+TPCDS_MARGIN_S = 4.0  # CPU kept back from the saving for the comparison pass itself
+TPCDS_EXEC_CAP_S = 8.0  # most CPU spent executing changed queries for one commit
+TPCDS_SLACK_S = 8.0  # wall-clock slack on top of margin + budget before a check is killed
 # wall clock; the run limit is 180 s (270 s in the final). Override only for big offline eval batches.
 TPCDS_BUDGET_S = float(os.environ.get("BR_TPCDS_BUDGET", "120"))
 
@@ -2214,25 +2274,25 @@ def plan_cost(workers, durations):
     return max(sum(durations[n] for n in w) for w in ws) + WORKER_COST_MS * len(ws) if ws else 0
 
 
-def tpcds_hash(overlay, expect=None, with_steps=False):
-    """Proxy hash of the source with `overlay` swapped in; None if it cannot be computed. With
-    `expect` (the pristine steps) the proxy stops at the first query that differs."""
+def tpcds_run(overlay, ref=None, budget=0.0, timeout=240, limit=1e9):
+    """Run TPCDS_CHECK with `overlay` swapped in. Returns (verdict dict, ref dict or None);
+    the verdict is {"ok": False} whenever anything goes wrong."""
     import subprocess
     try:
         p = subprocess.run([sys.executable, "-I", "-B", "-c", TPCDS_RUN], cwd=str(SRC),
-                           input=json.dumps({"src": str(SRC), "overlay": overlay, "proxy": TPCDS_PROXY,
-                                             "expect": expect}),
-                           capture_output=True, text=True, timeout=240,
+                           input=json.dumps({"src": str(SRC), "overlay": overlay, "code": TPCDS_CHECK,
+                                             "ref": ref, "budget": budget, "limit": limit}),
+                           capture_output=True, text=True, timeout=timeout,
                            env={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "PATH": os.environ.get("PATH", "")})
-        hits = [l.split()[0] for l in p.stderr.splitlines() if re.match(r"^[0-9a-f]{64} \d+ \d+ ", l)]
-        h = hits[-1] if p.returncode == 0 and hits else None
-        if with_steps:
-            st = [l.split()[1:] for l in p.stderr.splitlines() if l.startswith("STEPS ")]
-            return h, (st[-1] if st else None)
-        return h
+        lines = p.stderr.splitlines()
+        v = [json.loads(l[8:]) for l in lines if l.startswith("VERDICT ")]
+        r = [json.loads(l[4:]) for l in lines if l.startswith("REF ")]
+        if p.returncode != 0 or not v:
+            return {"ok": False, "why": "check crashed: " + (lines[-1][:150] if lines else str(p.returncode))}, None
+        return v[-1], (r[-1] if r else None)
     except Exception as e:
-        log("tpcds proxy failed:", repr(e))
-        return None
+        log("tpcds check failed:", repr(e))
+        return {"ok": False, "why": repr(e)}, None
 
 
 def _stmt_chain(tree, lo, hi):
@@ -2315,7 +2375,7 @@ def tpcds_region_ok(sel, rel, tree, oa, ob, why):
     return True
 
 
-def tpcds_skippable(sel):
+def tpcds_skippable(sel, budget=0.0):
     """True only if every change can reach test_execute_tpcds only through what the proxy compares,
     and the proxy dump of the patched source is identical to the pristine one."""
     base = sel.idx.get("tpcds_base")
@@ -2338,8 +2398,13 @@ def tpcds_skippable(sel):
         for oa, ob, _na, _nb in regions:
             if not tpcds_region_ok(sel, rel, tree, oa, ob, why):
                 return False
-    h = tpcds_hash({str(SRC / rel): text for rel, text in sel.patched.items()}, sel.idx.get("tpcds_steps"))
-    return h is not None and h == base
+    # a patch can make the optimizer very slow: cap the check's wall clock (a timeout keeps the test)
+    v, _ = tpcds_run({str(SRC / rel): text for rel, text in sel.patched.items()}, sel.idx["tpcds_ref"],
+                     budget, timeout=TPCDS_MARGIN_S + max(budget, 0) + TPCDS_SLACK_S,
+                     limit=TPCDS_MARGIN_S + max(budget, 0))
+    why.append("tpcds check: " + (f"same rows, executed {v.get('executed')}" if v.get("ok") else v.get("why", "?"))
+               + f" ({v.get('cpu')} s)")
+    return bool(v.get("ok"))
 
 
 def load_index():
@@ -2406,7 +2471,7 @@ def main():
                             why.append(f"tpcds proxy not worth it (saves {saving} ms)")
                         elif time.monotonic() - started > TPCDS_BUDGET_S:
                             why.append("tpcds proxy: time budget spent")
-                        elif tpcds_skippable(sel):
+                        elif tpcds_skippable(sel, min(TPCDS_EXEC_CAP_S, saving / 1000 - TPCDS_MARGIN_S)):
                             chosen = [n for n in chosen if n != tp]
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
                     except Exception as e:
