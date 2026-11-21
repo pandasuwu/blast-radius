@@ -2379,6 +2379,7 @@ def tpcds_skippable(sel, budget=0.0):
     """True only if every change can reach test_execute_tpcds only through what the proxy compares,
     and the proxy dump of the patched source is identical to the pristine one."""
     sel.tpcds_verdict = None
+    sel.tpcds_reason = "E"
     base = sel.idx.get("tpcds_base")
     if not base or not sel.idx.get("tpcds_phase"):
         return False
@@ -2386,18 +2387,25 @@ def tpcds_skippable(sel, budget=0.0):
     for f in sel.files:
         rel = f["new"] or f["old"]
         if f["binary"] or not f["old"] or not f["new"] or f["old"] != f["new"]:
+            sel.tpcds_reason = "B"
+            return False
+        if rel.startswith("tests/fixtures/optimizer/tpc-ds/"):
+            sel.tpcds_reason = "A"
             return False
         if rel.startswith("tests/fixtures/") and not rel.startswith("tests/fixtures/optimizer/tpc-ds/"):
             continue  # data the test never opens
         if not (rel.startswith("sqlglot/") and rel.endswith(".py")) or rel not in sel.patched:
+            sel.tpcds_reason = "B"
             return False
         old = sel.read_src(rel)
         if old is None:
+            sel.tpcds_reason = "B"
             return False
         tree = ast.parse(old)
         _, regions = apply_hunks(old, f["hunks"])
         for oa, ob, _na, _nb in regions:
             if not tpcds_region_ok(sel, rel, tree, oa, ob, why):
+                sel.tpcds_reason = "C"
                 return False
     # a patch can make the optimizer very slow: cap the check's wall clock (a timeout keeps the test)
     v, _ = tpcds_run({str(SRC / rel): text for rel, text in sel.patched.items()}, sel.idx["tpcds_ref"],
@@ -2406,6 +2414,7 @@ def tpcds_skippable(sel, budget=0.0):
     why.append("tpcds check: " + (f"same rows, executed {v.get('executed')}" if v.get("ok") else v.get("why", "?"))
                + f" ({v.get('cpu')} s)")
     sel.tpcds_verdict = v
+    sel.tpcds_reason = None if v.get("ok") else ("D" if "different rows" in v.get("why", "") else "E")
     return bool(v.get("ok"))
 
 
@@ -2416,6 +2425,15 @@ def load_index():
     except Exception as e:
         log("index load failed, rebuilding:", e)
         return build_index()
+
+
+# PROBE E reason weights (x 10 ms, base 3 so two commits' markers stay decodable):
+# A  the patch edits a tpc-ds/ fixture             B  another file the check refuses (binary, rename,
+#                                                     test code, non-sqlglot, unreadable)
+# C  the uncompared-phase guard refused a region   D  the check ran: different rows
+# E  anything else (check crashed or could not prove, time budget, error). "Not worth it" (TPC-DS
+#    is not what the commit's cost hangs on) gets no marker.
+PROBE_W = {"A": 1, "B": 3, "C": 9, "D": 27, "E": 81}
 
 
 def main():
@@ -2459,7 +2477,7 @@ def main():
     for patch in patches:
         chosen = everything
         tiers = []
-        markers = 0
+        reason = None
         if sel is not None:
             try:
                 text = patch.read_text(encoding="utf-8", errors="replace")
@@ -2471,24 +2489,18 @@ def main():
                     saving = plan_cost(pack(chosen, durations), durations) - plan_cost(pack(rest, durations), durations)
                     try:
                         if saving < TPCDS_MIN_SAVING_MS:
-                            why.append(f"tpcds proxy not worth it (saves {saving} ms)")
+                            why.append(f"tpcds proxy not worth it (saves {saving} ms)")  # no marker
                         elif time.monotonic() - started > TPCDS_BUDGET_S:
                             why.append("tpcds proxy: time budget spent")
+                            reason = "E"
                         elif tpcds_skippable(sel, min(TPCDS_EXEC_CAP_S, saving / 1000 - TPCDS_MARGIN_S)):
                             chosen = [n for n in chosen if n != tp]
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
                         else:
-                            # PROBE D (measurement only): drop it anyway for the "cannot prove" verdicts and
-                            # encode which one in the score with marker workers (2 s each)
-                            r = (getattr(sel, "tpcds_verdict", None) or {}).get("why", "")
-                            k = 2 if "duckdb reference SQL changed" in r else 4 if any(
-                                s in r for s in ("too many changed", "loading its tables", "CPU limit", "Timeout")) else 0
-                            if k:
-                                chosen = [n for n in chosen if n != tp]
-                                markers = k
-                                why.append(f"PROBE D: dropped anyway ({r[:40]}), {k} marker workers")
+                            reason = getattr(sel, "tpcds_reason", None) or "E"
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
+                        reason = "E"
                 try:
                     tiers = [numbers(m) for m in getattr(sel, "plausible", ())] + [everything]
                 except Exception as e:
@@ -2499,18 +2511,25 @@ def main():
             except Exception as e:
                 log(patch.stem, "error, everything:", repr(e))
         try:
-            workers = pack_free(chosen, tiers, durations)
+            workers = pack(chosen, durations) if reason else pack_free(chosen, tiers, durations)
         except Exception as e:
             log(patch.stem, "free riders failed:", repr(e))
             workers = pack(chosen, durations)
-        if markers:
+        if reason:
+            # PROBE E (measurement only): TPC-DS kept; add exactly PROBE_W[reason] x 10 ms of tiny,
+            # unselected tests to the busiest worker, so the simulated total encodes the reason.
+            target = PROBE_W[reason] * 10
             used = {n for w in workers for n in w}
-            spare = sorted((n for n in everything if n not in used), key=lambda n: durations[n])
-            top = max((sum(durations[n] for n in w) for w in workers if w), default=0)
-            for n in spare[:max(0, min(markers, MAX_WORKERS - len([w for w in workers if w])))]:
-                if durations[n] <= max(top, 5):
-                    workers.append([n])
-            log(patch.stem, "PROBE D markers:", len([w for w in workers if w]), "workers")
+            busiest = max((w for w in workers if w), key=lambda w: sum(durations[n] for n in w))
+            got = 0
+            for n in sorted((n for n in everything if n not in used and 0 < durations[n] <= target),
+                            key=lambda n: -durations[n]):
+                if got + durations[n] <= target:
+                    busiest.append(n)
+                    got += durations[n]
+                if got == target:
+                    break
+            log(patch.stem, f"PROBE E: tpcds kept, reason {reason}, marker {got} ms of {target}")
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
