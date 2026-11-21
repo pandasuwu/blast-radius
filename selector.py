@@ -697,6 +697,8 @@ def build_index():
             for ln in ls:
                 names.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", src_lines[ln - 1]))
         idx["tpcds_phase"] = {"lines": ulines, "classes": set(ph["classes"]), "names": names}
+        xc = json.load(open(APP / "maps" / "tpcds_xcov.json"))["lines"]
+        idx["tpcds_xcov"] = {rel: {int(l): int(m, 16) for l, m in d.items()} for rel, d in xc.items()}
         v, ref = tpcds_run({}, timeout=480)
         idx["tpcds_ref"] = ref if v.get("ok") and ref else None
         idx["tpcds_base"] = bool(idx["tpcds_ref"])
@@ -2210,6 +2212,10 @@ def verdict(**k):
 
 
 REF, BUDGET, LIMIT = globals().get("REF"), globals().get("BUDGET", 0.0), globals().get("LIMIT", 1e9)
+EXEC_ALL = globals().get("EXEC_ALL", False)  # the patch changes code the execution itself runs
+EXEC_SET = globals().get("EXEC_SET")  # with EXEC_ALL: only these queries run changed code (None: all)
+if EXEC_SET is not None:
+    EXEC_SET = set(EXEC_SET)
 sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
 parts, todo, est, tables = [], [], 0.0, {}
 for i, (meta, sql, _) in enumerate(sqls):
@@ -2230,8 +2236,9 @@ for i, (meta, sql, _) in enumerate(sqls):
     ref = REF["parts"][i]
     if ref is None or duck != ref[1]:
         verdict(ok=False, why=f"query {i}: duckdb reference SQL changed")
-    if names != ref[0] or opt != ref[2]:
-        # changed tree or tables: execute it now (as the test's pool child does) and compare rows
+    if (EXEC_ALL and (EXEC_SET is None or i in EXEC_SET)) or names != ref[0] or opt != ref[2]:
+        # changed tree or tables, or changed execution code: execute it now (as the test's pool
+        # child does) and compare rows
         est += REF["sec"][str(i)]
         if est > BUDGET:
             verdict(ok=False, why=f"query {i}: too many changed queries to execute")
@@ -2242,7 +2249,9 @@ for i, (meta, sql, _) in enumerate(sqls):
                 est += time.process_time() - t1
         if est > BUDGET:
             verdict(ok=False, why=f"query {i}: loading its tables spent the budget")
-        (strict, loose), _ = run(pickle.loads(blob), names, tables)
+        (strict, loose), took = run(pickle.loads(blob), names, tables)
+        if took > 3 * REF["sec"][str(i)] + 0.5:
+            verdict(ok=False, why=f"query {i}: execution much slower than pristine (slow patch?)")
         if strict != REF["res"][str(i)] and loose != REF["lres"][str(i)]:
             verdict(ok=False, why=f"query {i}: different rows")
         todo.append((i, blob, names))
@@ -2277,12 +2286,15 @@ be.FileLoader.get_data = _get_data
 sys.path.insert(0, d["src"])
 sys.argv = ["tpcds_check"]
 exec(compile(d["code"], "tpcds_check", "exec"), {"__name__": "__main__", "REF": d.get("ref"),
-                                                  "BUDGET": d.get("budget", 0.0), "LIMIT": d.get("limit", 1e9)})
+                                                  "BUDGET": d.get("budget", 0.0), "LIMIT": d.get("limit", 1e9),
+                                                  "EXEC_ALL": d.get("exec_all", False),
+                                                  "EXEC_SET": d.get("exec_set")})
 """
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_MIN_SAVING_MS = 6000  # the check costs about 2-3 s of charged CPU before any execution
 TPCDS_MARGIN_S = 4.0  # CPU kept back from the saving for the comparison pass itself
 TPCDS_EXEC_CAP_S = 8.0  # most CPU spent executing changed queries for one commit
+TPCDS_EXEC_ALL_CAP_S = 16.0  # when the patch changes execution code: up to all 57 queries (~14.6 s)
 TPCDS_SLACK_S = 8.0  # wall-clock slack on top of margin + budget before a check is killed
 # wall clock; the run limit is 180 s (270 s in the final). Override only for big offline eval batches.
 TPCDS_BUDGET_S = float(os.environ.get("BR_TPCDS_BUDGET", "120"))
@@ -2293,14 +2305,15 @@ def plan_cost(workers, durations):
     return max(sum(durations[n] for n in w) for w in ws) + WORKER_COST_MS * len(ws) if ws else 0
 
 
-def tpcds_run(overlay, ref=None, budget=0.0, timeout=240, limit=1e9):
+def tpcds_run(overlay, ref=None, budget=0.0, timeout=240, limit=1e9, exec_all=False, exec_set=None):
     """Run TPCDS_CHECK with `overlay` swapped in. Returns (verdict dict, ref dict or None);
     the verdict is {"ok": False} whenever anything goes wrong."""
     import subprocess
     try:
         p = subprocess.run([sys.executable, "-I", "-B", "-c", TPCDS_RUN], cwd=str(SRC),
                            input=json.dumps({"src": str(SRC), "overlay": overlay, "code": TPCDS_CHECK,
-                                             "ref": ref, "budget": budget, "limit": limit}),
+                                             "ref": ref, "budget": budget, "limit": limit,
+                                             "exec_all": exec_all, "exec_set": exec_set}),
                            capture_output=True, text=True, timeout=timeout,
                            env={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "PATH": os.environ.get("PATH", "")})
         lines = p.stderr.splitlines()
@@ -2442,6 +2455,7 @@ def tpcds_skippable(sel, budget=0.0):
     if not base or not sel.idx.get("tpcds_phase"):
         return False
     why = sel.why
+    exec_all, exec_set = False, 0
     for f in sel.files:
         rel = f["new"] or f["old"]
         if f["binary"] or not f["old"] or not f["new"] or f["old"] != f["new"]:
@@ -2476,11 +2490,39 @@ def tpcds_skippable(sel, budget=0.0):
                     and all(x in nc for x in range(na, nb + 1)):
                 continue  # only comment / blank lines removed and added here
             if not tpcds_region_ok(sel, rel, tree, oa, ob, why):
-                return False
+                # the change can reach code the test runs outside the compared calls: prove it by
+                # executing the queries for real (all of them, or those whose pipeline runs it)
+                exec_all = True
+                lo, hi = (oa, ob) if ob >= oa else (max(ob, 1), oa)
+                lines = set(range(lo, hi + 1))
+                chain = _stmt_chain(tree, lo, hi)
+                if chain:
+                    # the whole innermost statement: coverage marks a statement on the lines that hold
+                    # its bytecode, which need not include an edited continuation line
+                    lines |= set(range(first_line(chain[-1]), chain[-1].end_lineno + 1))
+                il = set(sel.idx["importlines"].get(rel, ()))
+                xc = sel.idx.get("tpcds_xcov")
+                if xc is None or lines & il or not any(isinstance(s, FUNC_TYPES) for s in chain):
+                    exec_set = None  # import-time change, or no map: execute every query
+                elif exec_set is not None:
+                    for x in lines:
+                        exec_set |= xc.get(rel, {}).get(x, 0)
     # a patch can make the optimizer very slow: cap the check's wall clock (a timeout keeps the test)
+    if exec_all:
+        qs = None if exec_set is None else [i for i in range(exec_set.bit_length()) if exec_set >> i & 1]
+        est = sum(v for k, v in sel.idx["tpcds_ref"]["sec"].items() if qs is None or int(k) in qs)
+        # pay at most the saving minus the comparison pass and a 2 s net gain
+        budget = min(TPCDS_EXEC_ALL_CAP_S, getattr(sel, "tpcds_saving_s", 0.0) - TPCDS_MARGIN_S - 2.0)
+        if est > budget:
+            why.append(f"tpcds check: executing {len(qs) if qs is not None else 'all'} queries would cost "
+                       f"{est:.1f} s > {budget:.1f} s")
+            return False
+        why.append(f"tpcds check: execute {'all' if qs is None else len(qs)} queries")
+    else:
+        qs = None
     v, _ = tpcds_run({str(SRC / rel): text for rel, text in sel.patched.items()}, sel.idx["tpcds_ref"],
                      budget, timeout=TPCDS_MARGIN_S + max(budget, 0) + TPCDS_SLACK_S,
-                     limit=TPCDS_MARGIN_S + max(budget, 0))
+                     limit=TPCDS_MARGIN_S + max(budget, 0), exec_all=exec_all, exec_set=qs)
     why.append("tpcds check: " + (f"same rows, executed {v.get('executed')}" if v.get("ok") else v.get("why", "?"))
                + f" ({v.get('cpu')} s)")
     return bool(v.get("ok"))
@@ -2877,7 +2919,8 @@ def main():
                             why.append(f"tpcds proxy not worth it (saves {saving} ms)")
                         elif time.monotonic() - started > TPCDS_BUDGET_S:
                             why.append("tpcds proxy: time budget spent")
-                        elif tpcds_skippable(sel, min(TPCDS_EXEC_CAP_S, saving / 1000 - TPCDS_MARGIN_S)):
+                        elif setattr(sel, "tpcds_saving_s", saving / 1000) or \
+                                tpcds_skippable(sel, min(TPCDS_EXEC_CAP_S, saving / 1000 - TPCDS_MARGIN_S)):
                             chosen = [n for n in chosen if n != tp]
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
                     except Exception as e:
