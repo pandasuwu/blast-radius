@@ -699,6 +699,12 @@ def build_index():
         idx["tpcds_phase"] = {"lines": ulines, "classes": set(ph["classes"]), "names": names}
         xc = json.load(open(APP / "maps" / "tpcds_xcov.json"))["lines"]
         idx["tpcds_xcov"] = {rel: {int(l): int(m, 16) for l, m in d.items()} for rel, d in xc.items()}
+        try:
+            eu = json.load(open(APP / "maps" / "tpcds_envuse.json"))["keys"]
+            idx["tpcds_envuse"] = {k: int(m, 16) for k, m in eu.items()}
+        except Exception as e:
+            log("tpcds ENV use map missing:", repr(e))
+            idx["tpcds_envuse"] = None
         v, ref = tpcds_run({}, timeout=480)
         # the budget check reads these timings: one noisy build must not push it over the budget,
         # so keep each query's fastest of 3 runs (the build is not charged)
@@ -2549,6 +2555,54 @@ def _same_tree(old, new):
         return False
 
 
+ENV_FILE = "sqlglot/executor/env.py"
+ENV_WRAPPERS = {"null_if_any", "filter_nulls"}  # build a wrapper around the function, never call it
+
+
+def _env_mask(v):
+    """An ENV value with the bodies of its lambdas blanked: a lambda itself, or a lambda passed
+    directly to one of ENV_WRAPPERS. Anything else is kept whole (it may run at import)."""
+    def blank(x):
+        return ast.Lambda(args=x.args, body=ast.Constant(None)) if isinstance(x, ast.Lambda) else x
+    if isinstance(v, ast.Lambda):
+        return blank(v)
+    if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id in ENV_WRAPPERS:
+        return ast.Call(func=v.func, args=[blank(a) for a in v.args], keywords=v.keywords)
+    return v
+
+
+def env_lambda_keys(old, new):
+    """Names of ENV entries whose only change is inside a lambda body, if that is the file's whole
+    change; else None. Creating a lambda runs none of its body, so only calls of those entries can
+    see the change (default values and the wrappers' arguments are compared whole)."""
+    try:
+        a, b = ast.parse(old), ast.parse(new)
+    except SyntaxError:
+        return None
+    if len(a.body) != len(b.body):
+        return None
+    keys = set()
+    for x, y in zip(a.body, b.body):
+        if ast.dump(x) == ast.dump(y):
+            continue
+        if not (isinstance(x, ast.Assign) and isinstance(y, ast.Assign) and len(x.targets) == len(y.targets) == 1
+                and all(isinstance(t.targets[0], ast.Name) and t.targets[0].id == "ENV" for t in (x, y))
+                and isinstance(x.value, ast.Dict) and isinstance(y.value, ast.Dict)
+                and len(x.value.keys) == len(y.value.keys)):
+            return None
+        for kx, ky, vx, vy in zip(x.value.keys, y.value.keys, x.value.values, y.value.values):
+            if (ast.dump(kx) if kx is not None else None) != (ast.dump(ky) if ky is not None else None):
+                return None  # a key added, removed or renamed
+            if ast.dump(vx) == ast.dump(vy):
+                continue
+            if not (isinstance(kx, ast.Constant) and isinstance(kx.value, str)):
+                return None  # a changed **unpacking or computed key
+            if ast.dump(_env_mask(vx)) != ast.dump(_env_mask(vy)):
+                return None
+            keys.add(kx.value)
+    return keys
+
+
 def tpcds_skippable(sel, budget=0.0):
     """True only if every change can reach test_execute_tpcds only through what the proxy compares,
     and the proxy dump of the patched source is identical to the pristine one."""
@@ -2578,6 +2632,17 @@ def tpcds_skippable(sel, budget=0.0):
             old = sel.read_src(rel)
             if old is not None and _same_tree(old, sel.patched[rel]):
                 continue  # comments / formatting only: no code object changes
+        eu = sel.idx.get("tpcds_envuse")
+        if rel == ENV_FILE and rel in sel.patched and eu is not None and sel.read_src(rel) is not None:
+            keys = env_lambda_keys(sel.read_src(rel), sel.patched[rel])
+            if keys is not None:
+                # only queries whose generated code calls those entries run the changed bodies
+                exec_all = True
+                if exec_set is not None:
+                    for k in keys:
+                        exec_set |= eu.get(k, 0)
+                why.append(f"tpcds check: ENV lambda bodies only ({', '.join(sorted(keys))})")
+                continue
         if not (rel.startswith("sqlglot/") and rel.endswith(".py")) or rel not in sel.patched:
             return False
         old = sel.read_src(rel)
