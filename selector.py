@@ -2325,6 +2325,10 @@ for i, (meta, sql, _) in enumerate(sqls):
             # rows or reference differ from pristine: decide exactly as the test does
             if not REF.get("dres"):
                 verdict(ok=False, why=f"query {i}: different rows")
+            if not duck_changed and REF.get("shape") and                     [list(table.columns), len(table.rows)] != REF["shape"][str(i)]:
+                # pristine rows pass the test, so another shape fails assert_frame_equal for sure:
+                # no need to load pandas to find out
+                verdict(ok=False, why=f"query {i}: different rows (other shape)")
             est += (0.0 if "pandas" in sys.modules else 1.2) + REF["dsec"][str(i)] + (0.5 if not _DUCK else 0.0)
             if est > BUDGET:
                 verdict(ok=False, why=f"query {i}: different rows (no budget for the exact check)")
@@ -2334,9 +2338,10 @@ for i, (meta, sql, _) in enumerate(sqls):
 if REF is None:
     for n in sorted({n for _, _, ns, _ in todo for n in ns}):
         tables[n] = load_table(n)
-    res, lres, sec, dres, dsec = {}, {}, {}, {}, {}
+    res, lres, sec, dres, dsec, shape = {}, {}, {}, {}, {}, {}
     for i, blob, names, duck_sql in todo:
-        (res[str(i)], lres[str(i)]), sec[str(i)], _ = run(pickle.loads(blob), names, tables)
+        (res[str(i)], lres[str(i)]), sec[str(i)], r = run(pickle.loads(blob), names, tables)
+        shape[str(i)] = [list(r.columns), len(r.rows)]
     try:
         for i, blob, names, duck_sql in todo:
             dres[str(i)], dsec[str(i)] = duck_digest(duck_sql)
@@ -2344,7 +2349,7 @@ if REF is None:
     except Exception as e:  # no duckdb: a changed reference SQL keeps the test, as before
         print("no duckdb reference:", repr(e), file=sys.stderr)
         dres, dsec = None, None
-    print("REF " + json.dumps({"parts": parts, "res": res, "lres": lres, "dres": dres, "dsec": dsec,
+    print("REF " + json.dumps({"parts": parts, "res": res, "lres": lres, "dres": dres, "dsec": dsec, "shape": shape,
                                "sec": {k: round(v, 3) for k, v in sec.items()}}), file=sys.stderr)
     verdict(ok=True, ref=True)
 verdict(ok=True, executed=[i for i, _, _ in todo])
