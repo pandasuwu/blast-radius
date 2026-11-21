@@ -117,7 +117,109 @@ class Probe:
         return v
 
 
+_DEFKEY = {}
+
+
+def _class_key(c):
+    return f"{c.__module__}:{c.__qualname__}"
+
+
+def _defkey(obj, name):
+    """Where getattr(obj, name) found its value: 'module:Class' of the defining class,
+    'inst' for an instance/module dict, '?' when unknown (super(), __getattr__, ...)."""
+    if isinstance(obj, type):
+        k = _DEFKEY.get((obj, name))
+        if k is None:
+            k = "?"
+            for c in obj.__mro__:
+                if name in c.__dict__:
+                    k = _class_key(c)
+                    break
+            _DEFKEY[(obj, name)] = k
+        return k
+    if type(obj) is super:
+        return "?"
+    d = getattr(obj, "__dict__", None)
+    if isinstance(d, dict) and name in d:
+        return "inst"
+    t = type(obj)
+    k = _DEFKEY.get((t, name))
+    if k is None:
+        k = "?"
+        for c in t.__mro__:
+            if name in c.__dict__:
+                k = _class_key(c)
+                break
+        _DEFKEY[(t, name)] = k
+    return k
+
+
+def _import_stmt():
+    """At import/collection time: (rel, line) of the innermost module- or class-body frame
+    in the repo, i.e. the top-level statement whose evaluation is doing this read."""
+    f = sys._getframe(3)
+    while f is not None:
+        co = f.f_code
+        if not (co.co_flags & 0x1) and co.co_filename.startswith(ROOT + "/"):
+            return f"{os.path.relpath(co.co_filename, ROOT)}:{f.f_lineno}"
+        f = f.f_back
+    return ""
+
+
+def _ga(nid, obj, name):
+    v = getattr(obj, name)
+    if not ALT[0]:
+        try:
+            k = _defkey(obj, name)
+        except Exception:
+            k = "?"
+        if not CUR[0]:
+            k = k + "@" + _import_stmt()
+        _rec(nid, k)
+    return v
+
+
+Probe.ga = staticmethod(_ga)
 builtins._BRP_ = Probe()
+
+
+def _attr_names():
+    """Names assigned in class bodies of sqlglot (excluding Enum classes' members)."""
+    trees = []
+    for dirpath, _, files in os.walk(PKG):
+        for fn in files:
+            if fn.endswith(".py"):
+                try:
+                    trees.append(ast.parse(open(os.path.join(dirpath, fn), encoding="utf-8").read()))
+                except SyntaxError:
+                    pass
+    enums = {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "AutoName"}
+    changed = True
+    while changed:
+        changed = False
+        for t in trees:
+            for n in ast.walk(t):
+                if isinstance(n, ast.ClassDef) and n.name not in enums:
+                    for b in n.bases:
+                        bn = b.attr if isinstance(b, ast.Attribute) else getattr(b, "id", None)
+                        if bn in enums:
+                            enums.add(n.name)
+                            changed = True
+                            break
+    names = set()
+    for t in trees:
+        for n in ast.walk(t):
+            if isinstance(n, ast.ClassDef) and n.name not in enums:
+                for s in n.body:
+                    targets = s.targets if isinstance(s, ast.Assign) else [s.target] if isinstance(s, (ast.AnnAssign, ast.AugAssign)) else []
+                    for tg in targets:
+                        for x in ast.walk(tg):
+                            if isinstance(x, ast.Name):
+                                names.add(x.id)
+    return names
+
+
+ATTRNAMES = _attr_names()
 
 BAD = (ast.NamedExpr, ast.Yield, ast.YieldFrom, ast.Await)
 
@@ -172,6 +274,18 @@ class Instrument(ast.NodeTransformer):
         call = ast.Call(
             func=ast.Attribute(value=ast.Name("_BRP_", ast.Load()), attr="cmp", ctx=ast.Load()),
             args=[ast.Constant(nid), ast.Constant(op), node.left, node.comparators[0]], keywords=[])
+        return ast.copy_location(call, node)
+
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        if self.depth == 0 or not isinstance(node.ctx, ast.Load) or node.attr not in ATTRNAMES:
+            return node
+        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == "super":
+            return node  # super().X: keep zero-arg super() in place
+        nid = self._nid(node, "attr", node.attr)
+        call = ast.Call(
+            func=ast.Attribute(value=ast.Name("_BRP_", ast.Load()), attr="ga", ctx=ast.Load()),
+            args=[ast.Constant(nid), node.value, ast.Constant(node.attr)], keywords=[])
         return ast.copy_location(call, node)
 
     def visit_BoolOp(self, node):
@@ -287,7 +401,68 @@ def pytest_runtest_logreport(report):
     OUTCOMES.setdefault(report.nodeid, []).append(f"{report.when}:{report.outcome}")
 
 
+def _identity_decorators():
+    """Decorator call sites in sqlglot whose (external) factory returns the decorated object
+    unchanged for the original constant arguments and every bool-flip / int+-1 variant."""
+    import importlib
+    out = []
+    for name, mod in list(sys.modules.items()):
+        if not name.startswith("sqlglot") or mod is None or not getattr(mod, "__file__", None):
+            continue
+        path = os.path.realpath(mod.__file__)
+        if not path.startswith(PKG):
+            continue
+        rel = os.path.relpath(path, ROOT)
+        try:
+            tree = ast.parse(open(path, encoding="utf-8").read())
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            for dec in getattr(node, "decorator_list", []) or []:
+                if not isinstance(dec, ast.Call):
+                    continue
+                consts = list(dec.args) + [k.value for k in dec.keywords]
+                if not all(isinstance(c, ast.Constant) for c in consts) or any(k.arg is None for k in dec.keywords):
+                    continue
+                try:
+                    fn = eval(compile(ast.Expression(dec.func), rel, "eval"), vars(mod))
+                except Exception:
+                    continue
+                if getattr(fn, "__module__", "sqlglot").startswith("sqlglot"):
+                    continue
+                args = [c.value for c in dec.args]
+                kws = {k.arg: k.value.value for k in dec.keywords}
+                variants = [(list(args), dict(kws))]
+                for i, a in enumerate(args):
+                    for alt in ((not a,) if isinstance(a, bool) else (a + 1, a - 1) if isinstance(a, int) else ()):
+                        variants.append((args[:i] + [alt] + args[i + 1:], dict(kws)))
+                for k, a in kws.items():
+                    for alt in ((not a,) if isinstance(a, bool) else (a + 1, a - 1) if isinstance(a, int) else ()):
+                        variants.append((list(args), {**kws, k: alt}))
+                ok = True
+                for va, vk in variants:
+                    try:
+                        d = fn(*va, **vk)
+
+                        class _Probe:
+                            pass
+
+                        def _probe():
+                            pass
+
+                        if d(_Probe) is not _Probe or d(_probe) is not _probe:
+                            ok = False
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        break
+                if ok:
+                    out.append([rel, dec.lineno, dec.col_offset])
+    return out
+
+
 def pytest_sessionfinish(session):
     prof = {str(nid): {sig: sorted(ctxs) for sig, ctxs in d.items()} for nid, d in PROF.items()}
     with open(os.path.join(OUT, "profile.json"), "w") as f:
-        json.dump({"nodes": NODES, "prof": prof, "outcomes": OUTCOMES}, f)
+        json.dump({"nodes": NODES, "prof": prof, "outcomes": OUTCOMES, "attrnames": sorted(ATTRNAMES),
+                   "identity_decorators": _identity_decorators()}, f)

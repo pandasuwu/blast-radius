@@ -36,7 +36,26 @@ INDEX = Path(os.environ.get("BR_INDEX", APP / "index.pkl"))
 MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 MAX_DEPTH = 4
-CHECK_FULL = os.environ.get("BR_FULLPARSE") == "1"  # evaluation: force the full-file parse path
+CHECK_FULL = os.environ.get("BR_FULLPARSE") == "1"
+IMPORT_CHECK = r"""
+import contextlib, importlib, importlib._bootstrap_external as be, io, json, os, sys
+d = json.load(sys.stdin)
+ov = {os.path.realpath(k): v.encode("utf-8") for k, v in d["overlay"].items()}
+_orig = be.FileLoader.get_data
+def _get_data(self, path):
+    rp = os.path.realpath(path)
+    return ov[rp] if rp in ov else _orig(self, path)
+be.FileLoader.get_data = _get_data
+sys.path.insert(0, d["src"])
+failed = []
+for m in d["mods"]:
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            importlib.import_module(m)
+    except BaseException:
+        failed.append(m)
+print(json.dumps({"failed": failed}))
+"""  # evaluation: force the full-file parse path
 
 
 def log(*a):
@@ -324,8 +343,8 @@ class RefIndexer:
                 if isinstance(v, ast.AST):
                     yield v
 
-    def _add(self, name, u, resolved, kind):
-        self.refs.setdefault(name, []).append((u, resolved, kind))
+    def _add(self, name, u, resolved, kind, pos=(0, 0)):
+        self.refs.setdefault(name, []).append((u, resolved, kind) + pos)
 
     def _refs_in(self, node, class_stack, unit, runtime):
         stack = [(node, runtime, unit)]
@@ -360,9 +379,9 @@ class RefIndexer:
                     if base and base.startswith(("sqlglot", "tests")):
                         full = ".".join([base] + c[1:])
                 if full is not None:
-                    self._add(n.attr, u, full, 1)
+                    self._add(n.attr, u, full, 1, (n.lineno, n.col_offset))
                 elif n.attr in self.attrnames:
-                    self._add(n.attr, u, None, 1)
+                    self._add(n.attr, u, None, 1, (n.lineno, n.col_offset))
                 stack.append((n.value, rt, u))
                 continue
             for child in ast.iter_child_nodes(n):
@@ -407,6 +426,15 @@ def build_index():
             prof[rel] = {tuple(map(int, k.split(","))): (kind, op, imp, [(sig, psets[i]) for sig, i in sigs])
                          for k, (kind, op, imp, sigs) in nodes.items()}
         untrusted = int(p["untrusted"], 16)
+        attr_instr = set(p.get("attrnames", ()))
+        attrprof, attrpos = {}, set()
+        for rel, nodes in prof.items():
+            for (l, c, el, ec), (kind, op, imp, sigs) in nodes.items():
+                if kind == "attr":
+                    attrprof.setdefault(op, []).append((rel, l, imp, sigs))
+                    attrpos.add((rel, l, c))
+        idx["attr_instr"], idx["attrprof"], idx["attrpos"] = attr_instr, attrprof, attrpos
+        idx["identity_decorators"] = {tuple(x) for x in p.get("identity_decorators", ())}
     idx["prof"], idx["untrusted"] = prof, untrusted
     trees = {}
     attrnames = set()
@@ -448,6 +476,54 @@ def build_index():
                         if hit:
                             sens_units.append((rel, node.lineno, node.end_lineno))
                             break
+    # module re-exports (`from sqlglot import expressions as exp` -> sqlglot.exp is that module)
+    mod_alias = {}
+    for rel, (tree, text) in trees.items():
+        mod = module_name(rel)
+        pkg = mod if rel.endswith("__init__.py") else mod.rpartition(".")[0]
+        for st in tree.body:
+            if isinstance(st, ast.ImportFrom):
+                base = st.module or ""
+                if st.level:
+                    pk = pkg.split(".")
+                    pk = pk[: len(pk) - (st.level - 1)] if st.level > 1 else pk
+                    base = ".".join(pk + ([base] if base else []))
+                for a in st.names:
+                    full = f"{base}.{a.name}"
+                    if full in modules and a.asname:
+                        mod_alias[f"{mod}.{a.asname}"] = full
+            elif isinstance(st, ast.Import):
+                for a in st.names:
+                    if a.asname and a.name in modules:
+                        mod_alias[f"{mod}.{a.asname}"] = a.name
+
+    def norm(r):
+        for _ in range(4):
+            head, rest = r, ""
+            hit = False
+            while head:
+                if head in mod_alias:
+                    r = mod_alias[head] + rest
+                    hit = True
+                    break
+                head, _, tail = head.rpartition(".")
+                rest = "." + tail + rest
+            if not hit:
+                break
+        return r
+
+    extra = []
+    for name, lst in refs.items():
+        for i, (u, resolved, kind, *pos) in enumerate(lst):
+            if resolved:
+                nr = norm(resolved)
+                if nr != resolved:
+                    lst[i] = (u, nr, kind, *pos)
+                    resolved = nr
+            if kind == 0 and resolved and resolved.rsplit(".", 1)[-1] != name:
+                extra.append((resolved.rsplit(".", 1)[-1], (u, resolved, kind, *pos)))
+    for name, entry in extra:
+        refs.setdefault(name, []).append(entry)
     # map refs to package re-exports ("sqlglot.dialects.Athena") onto the defining module
     pkg_reexport = {}
     for mod, names in toplevel.items():
@@ -458,7 +534,7 @@ def build_index():
                 pkg_reexport.setdefault(f"{pkg}.{nm}", set()).add(mod)
     mod_refunits = {}
     for name, lst in refs.items():
-        for u, resolved, kind in lst:
+        for u, resolved, kind, *_pos in lst:
             if resolved is None or units[u][3] != "f":
                 continue
             target = resolved
@@ -799,6 +875,32 @@ class Selector:
         self.memo[key] = m
         return m
 
+    def maybe_import_break(self, mod):
+        """The module *might* now raise at import: decided once per commit by really importing
+        the patched modules (see check_imports); nothing is added here."""
+        self.pending_imports.add(mod)
+        return 0
+
+    def check_imports(self):
+        """Import every pending module in a fresh interpreter with the patched sources swapped in;
+        returns the modules that fail (all of them if the check itself cannot run)."""
+        mods = sorted(self.pending_imports)
+        if not mods:
+            return []
+        import subprocess
+        payload = json.dumps({"src": str(SRC), "mods": mods,
+                              "overlay": {str(SRC / rel): text for rel, text in self.patched.items()}})
+        try:
+            p = subprocess.run([sys.executable, "-I", "-B", "-c", IMPORT_CHECK], input=payload,
+                               capture_output=True, text=True, timeout=90,
+                               env={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "PATH": os.environ.get("PATH", "")})
+            out = [l for l in p.stdout.splitlines() if l.startswith("{")]
+            failed = json.loads(out[-1])["failed"]
+        except Exception as e:
+            log("import check failed:", repr(e))
+            return mods
+        return failed
+
     def import_break(self, mod):
         """The module may now fail to import: every test that (transitively) imports it."""
         key = ("ib", mod)
@@ -849,7 +951,7 @@ class Selector:
         self.memo[key] = 0  # cycle guard
         m = 0
         full = f"{mod}.{name}"
-        for u, resolved, kind in self.idx["refs"].get(name, ()):
+        for u, resolved, kind, *_pos in self.idx["refs"].get(name, ()):
             if resolved is None:
                 continue
             if kind == 1:
@@ -912,6 +1014,26 @@ class Selector:
                         return r
         return None
 
+    def stmt_unit(self, loc):
+        """Innermost module/class-level statement unit containing 'rel:line'."""
+        memo = self.memo.get("stmt_units")
+        if memo is None:
+            memo = {}
+            for i, (rel, a, b, kind, *_rest) in enumerate(self.idx["units"]):
+                if kind in ("m", "c"):
+                    memo.setdefault(rel, []).append((a, b, i))
+            self.memo["stmt_units"] = memo
+        rel, _, line = loc.rpartition(":")
+        try:
+            line = int(line)
+        except ValueError:
+            return None
+        best = None
+        for a, b, i in memo.get(rel, ()):
+            if a <= line <= b and (best is None or a >= best[0]):
+                best = (a, b, i)
+        return best[2] if best else None
+
     def enclosing_class(self, rel, a, b):
         best = None
         for k, info in self.idx["classinfo"].items():
@@ -925,9 +1047,9 @@ class Selector:
         mod, qual = ck.split(":", 1)
         return dotted == f"{mod}.{qual}" or dotted.endswith("." + qual)
 
-    def class_attr(self, ck, name, depth=0):
+    def class_attr(self, ck, name, depth=0, added=False):
         """Tests that can observe a change of attribute `name` of class `ck`."""
-        key = ("ca", ck, name)
+        key = ("ca", ck, name, added)
         if key in self.memo:
             return self.memo[key]
         self.memo[key] = 0
@@ -939,8 +1061,42 @@ class Selector:
         unsafe = depth >= MAX_DEPTH
         needs_outer = unsafe
         own_meta = self.metaclass_of(ck)
-        for u, resolved, kind in self.idx["refs"].get(name, ()):
+        # instrumented reads (attribute profile) say exactly which tests read ck's own value;
+        # a newly added attribute shadows a parent's value, which the profile cannot attribute
+        use_prof = not added and name in self.idx.get("attr_instr", ())
+        attrpos = self.idx.get("attrpos", ())
+        direct = 0
+        if use_prof:
+            for prel, pline, imp, sigs in self.idx["attrprof"].get(name, ()):
+                for k in imp:
+                    key_, _, loc = k.partition("@")
+                    if key_ != "?" and key_ != ck:
+                        continue
+                    # read while import-time statement `loc` ran: only what that statement
+                    # defines can carry the change
+                    u = self.stmt_unit(loc) if loc and depth < MAX_DEPTH else None
+                    if u is not None:
+                        urel, ua, ub, ukind, uowner, udef, ucls = self.idx["units"][u]
+                        if ucls and (ucls == ck or self.is_subclass(ucls.replace(":", "."), ck)):
+                            # read while creating ck (or a subclass): what the metaclass derives
+                            # lives on that class, so its users can observe it
+                            m |= self.class_users(ucls) | users
+                            continue
+                        m |= self.unit_tests(u, depth + 1)
+                        # another statement read it at import: it may now raise there too
+                        m |= self.maybe_import_break(module_name(urel))
+                        continue
+                    unsafe = True
+                    reader = self.enclosing_class(prel, pline, pline)
+                    if reader is None or own_meta is None or not self.same_class(own_meta, reader):
+                        needs_outer = True
+                for k, mask in sigs:
+                    if k == "?" or k == ck:
+                        direct |= mask
+        for u, resolved, kind, *_pos in self.idx["refs"].get(name, ()):
             urel, a, b, ukind = self.idx["units"][u][:4]
+            if use_prof and kind == 1 and _pos and (urel, _pos[0], _pos[1]) in attrpos:
+                continue  # covered by the attribute profile
             if ukind == "f":
                 if self.is_import_time(urel, a, b):
                     if resolved is None or self.is_subclass(resolved.rpartition(".")[0], ck) or kind == 0:
@@ -983,6 +1139,7 @@ class Selector:
                 m |= self.class_users(f"{mod}:{outer}")
         else:
             m |= users & runtime
+        m |= direct
         self.memo[key] = m
         return m
 
@@ -1517,10 +1674,11 @@ class Selector:
             q = f"{ck.split(':', 1)[1]}.{o.name}" if ck else o.name
             new_ck = f"{self.mod}:{q}"
             m = 0
-            if [dump(x) for x in o.bases + o.keywords + o.decorator_list] != [dump(x) for x in n.bases + n.keywords + n.decorator_list]:
+            if [dump(x) for x in o.bases + o.keywords] != [dump(x) for x in n.bases + n.keywords] or \
+                    not self.same_decorators(o.decorator_list, n.decorator_list):
                 self.why.append(f"class header {new_ck}")
                 m |= self.class_users(new_ck) | self.name_change(o.name, ck) | self.subclass_registry(o, n)
-                m |= self.import_break(self.mod)
+                m |= self.maybe_import_break(self.mod)
             return m | self.body(o.body, n.body, new_ck)
         if isinstance(o, FUNC_TYPES) and isinstance(n, FUNC_TYPES):
             m = self.cover(self.rel, first_line(o), o.end_lineno)
@@ -1533,7 +1691,7 @@ class Selector:
                 m |= self.name_change(o.name, ck)
                 if [dump(x) for x in o.decorator_list] != [dump(x) for x in n.decorator_list] or not all(
                         self.safe_expr(d) for d in n.args.defaults + n.args.kw_defaults if d is not None):
-                    m |= self.import_break(self.mod)
+                    m |= self.maybe_import_break(self.mod)
             if body_import and [dump(x) for x in o.body] == [dump(x) for x in n.body]:
                 body_import = False  # only the signature changed (handled above)
             if body_import:
@@ -1545,6 +1703,21 @@ class Selector:
                 self.why.append(f"function {where}")
             return m
         return self.stmt(o, n, ck)
+
+    def same_decorators(self, olds, news):
+        """Equal, or differing only in constant arguments of identity decorator factories."""
+        if len(olds) != len(news):
+            return False
+        ident = self.idx.get("identity_decorators", set())
+        for a, b in zip(olds, news):
+            if dump(a) == dump(b):
+                continue
+            if not (isinstance(a, ast.Call) and isinstance(b, ast.Call) and dump(a.func) == dump(b.func)
+                    and (self.rel, a.lineno, a.col_offset) in ident
+                    and len(a.args) == len(b.args) and [k.arg for k in a.keywords] == [k.arg for k in b.keywords]
+                    and all(isinstance(x, ast.Constant) for x in b.args + [k.value for k in b.keywords])):
+                return False
+        return True
 
     def subclass_registry(self, o, n):
         """Bases changed/added/removed: users of every base class (registries, MRO)."""
@@ -1571,14 +1744,17 @@ class Selector:
                 self.check_import(node)
             if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
                 raise Everything("star import changed")
-        if not self.safe_pair(o, n):
-            self.why.append(f"may raise at import ({ck or self.mod})")
+        if isinstance(o, (ast.Import, ast.ImportFrom)) or isinstance(n, (ast.Import, ast.ImportFrom)):
+            # imports change what gets loaded at import time (registries, lazy-load checks)
             m |= self.import_break(self.mod)
+        elif not self.safe_pair(o, n):
+            self.why.append(f"may raise at import ({ck or self.mod})")
+            m |= self.maybe_import_break(self.mod)
         if (o is None or n is None) and names and not ck:
             # removing a module-level name that import-time code reads raises NameError
             if n is None and any(self.idx["units"][u][3] != "f" for nm in names
-                                 for u, r, k in self.idx["refs"].get(nm, ()) if r):
-                m |= self.import_break(self.mod)
+                                 for u, r, k, *_pos in self.idx["refs"].get(nm, ()) if r):
+                m |= self.maybe_import_break(self.mod)
         if isinstance(o or n, ast.ClassDef) and (o is None or n is None):
             m |= self.subclass_registry(o, n)
         if ck and isinstance(o or n, FUNC_TYPES):
@@ -1587,8 +1763,12 @@ class Selector:
             self.why.append(f"stmt without names in {ck or self.mod}")
             return m | (self.class_users(ck) if ck else self.module_users(self.mod))
         self.why.append(f"names {sorted(names)[:4]} in {ck or self.mod}")
+        added = defined_names(n) - defined_names(o)
         for name in names:
-            m |= self.name_change(name, ck)
+            if ck and name in added:
+                m |= self.class_attr(ck, name, added=True)
+            else:
+                m |= self.name_change(name, ck)
         return m
 
     def method_added_removed(self, ck, name):
@@ -1616,9 +1796,16 @@ class Selector:
             return 0, ["empty patch"]
         self.new_modules = {module_name(f["new"]) for f in files if f["new"] and f["new"].endswith(".py")}
         self.changed = {f["old"] or f["new"] for f in files} | {f["new"] or f["old"] for f in files}
+        self.pending_imports = set()
+        self.patched = {}
         mask = 0
         for f in files:
             mask |= self.file_change(f)
+        if self.pending_imports:
+            failed = self.check_imports()
+            why.append(f"import check {sorted(self.pending_imports)[:3]} -> failed {failed[:3]}")
+            for mod in failed:
+                mask |= self.import_break(mod)
         return mask, why
 
     def read_src(self, rel):
@@ -1644,6 +1831,8 @@ class Selector:
             raise Everything("unknown file " + old_rel)
         if new_rel:
             new_text, regions = apply_hunks(old_text or "", f["hunks"])
+            if new_rel.endswith(".py"):
+                self.patched[new_rel] = new_text
         else:
             new_text, regions = None, []
         is_py = rel.endswith(".py")

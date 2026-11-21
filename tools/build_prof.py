@@ -77,4 +77,4 @@ print("nodes", len(d["nodes"]), "profiled", len(d["prof"]), "sets", len(sets),
       "untrusted", [tests[i] for i in range(len(tests)) if untrusted >> i & 1][:10])
 with gzip.open(dest, "wt", compresslevel=9) as fh:
     json.dump({"tests": tests, "sets": [format(m, "x") for m in sets], "nodes": out,
-               "untrusted": format(untrusted, "x")}, fh, separators=(",", ":"))
+               "untrusted": format(untrusted, "x"), "attrnames": d.get("attrnames", []), "identity_decorators": d.get("identity_decorators", [])}, fh, separators=(",", ":"))
