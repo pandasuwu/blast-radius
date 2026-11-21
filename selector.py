@@ -2420,6 +2420,7 @@ def _same_tree(old, new):
 def tpcds_skippable(sel, budget=0.0):
     """True only if every change can reach test_execute_tpcds only through what the proxy compares,
     and the proxy dump of the patched source is identical to the pristine one."""
+    sel.tpcds_verdict = None
     base = sel.idx.get("tpcds_base")
     if not base or not sel.idx.get("tpcds_phase"):
         return False
@@ -2454,6 +2455,7 @@ def tpcds_skippable(sel, budget=0.0):
                      limit=TPCDS_MARGIN_S + max(budget, 0))
     why.append("tpcds check: " + (f"same rows, executed {v.get('executed')}" if v.get("ok") else v.get("why", "?"))
                + f" ({v.get('cpu')} s)")
+    sel.tpcds_verdict = v
     return bool(v.get("ok"))
 
 
@@ -2834,6 +2836,7 @@ def main():
     for patch in patches:
         chosen = everything
         tiers = []
+        markers = 0
         if sel is not None:
             try:
                 text = patch.read_text(encoding="utf-8", errors="replace")
@@ -2853,6 +2856,14 @@ def main():
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
+                    if tp in chosen:
+                        # PROBE F (measurement only): drop it anyway and mark why it was kept:
+                        # check crashed -> 1 worker, different rows -> 2, check never ran -> 4
+                        v = getattr(sel, "tpcds_verdict", None) if saving >= TPCDS_MIN_SAVING_MS else None
+                        r = (v or {}).get("why", "")
+                        markers = 4 if v is None else 1 if "check crashed" in r else 2 if "different rows" in r else 0
+                        chosen = [n for n in chosen if n != tp]
+                        why.append(f"PROBE F: kept because {r[:50] or 'never ran'}; dropped, {markers} markers")
                 if VERIFY_ON and chosen and time.monotonic() - started < VERIFY_BUDGET_S \
                         and plan_cost(pack(chosen, durations), durations) < VERIFY_MAX_COST_MS \
                         and not any(tests[n]["file"] in VERIFY_HEAVY for n in chosen):
@@ -2885,6 +2896,14 @@ def main():
         except Exception as e:
             log(patch.stem, "free riders failed:", repr(e))
             workers = pack(chosen, durations)
+        if markers:
+            used = {n for w in workers for n in w}
+            spare = sorted((n for n in everything if n not in used), key=lambda n: durations[n])
+            top = max((sum(durations[n] for n in w) for w in workers if w), default=0)
+            for n in spare[:max(0, min(markers, MAX_WORKERS - len([w for w in workers if w])))]:
+                if durations[n] <= max(top, 5):
+                    workers.append([n])
+            log(patch.stem, "PROBE F markers:", len([w for w in workers if w]), "workers")
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     if zyg is not None:
         zyg.close()
