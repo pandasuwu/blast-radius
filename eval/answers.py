@@ -10,6 +10,8 @@ for mid, m in meta.items():
     if not os.path.exists(p):
         continue
     d = json.load(open(p))
+    if d.get("timeout"):
+        continue
     failing = {num[f] for f in d["failed"] if f in num}
     for c in d["collect"]:  # a test file that cannot be imported fails all its tests
         failing |= {t["number"] for t in tests if t["id"].startswith(c.split("::")[0])}

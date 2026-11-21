@@ -31,10 +31,17 @@ for i, name in enumerate(patches):
             open(p, "w", encoding="utf-8").write(new)
         t0 = time.time()
         env["FAIL_OUT"] = out + ".tmp"
-        r = subprocess.run([sys.executable, "-m", "pytest", "-p", "failplugin", "-p", "no:cacheprovider", "-q",
-                            "-n", nproc, "--timeout=600", "tests"], cwd=work, env=env,
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        os.replace(out + ".tmp", out)
+        proc = subprocess.Popen([sys.executable, "-m", "pytest", "-p", "failplugin", "-p", "no:cacheprovider", "-q",
+                                 "-n", nproc, "--timeout=600", "tests"], cwd=work, env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            proc.wait(timeout=900)
+            os.replace(out + ".tmp", out)
+        except subprocess.TimeoutExpired:
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            json.dump({"failed": [], "collect": [], "exit": -1, "timeout": True}, open(out, "w"))
         d = json.load(open(out))
         print(mid, f"{time.time()-t0:.0f}s", "failed", len(d["failed"]), "collect", len(d["collect"]), flush=True)
     finally:

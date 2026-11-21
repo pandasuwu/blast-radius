@@ -493,8 +493,15 @@ def build_index():
     importsens = walkers
     for rel, a, b in sens_units:
         importsens |= cover(rel, a, b)
+    mod_refmask = {}
+    for mod, us in mod_refunits.items():
+        mm = 0
+        for u in us:
+            mm |= cover(*units[u][:3])
+        if mm:
+            mod_refmask[mod] = mm
     idx.update(units=units, refs=refs, classinfo=classinfo, modules=modules, walkers=walkers,
-               core=core, rdeps=rdeps, importsens=importsens, mod_refunits=mod_refunits,
+               core=core, rdeps=rdeps, importsens=importsens, mod_refmask=mod_refmask,
                attrnames=attrnames, toplevel=toplevel)
     return idx
 
@@ -717,9 +724,7 @@ class Selector:
         for ck, s in self.idx["classes"].items():
             if ck.startswith(pref):
                 m |= s
-        for u in self.idx["mod_refunits"].get(mod, ()):
-            rel, a, b = self.idx["units"][u][:3]
-            m |= self.cover(rel, a, b)
+        m |= self.idx["mod_refmask"].get(mod, 0)
         self.memo[key] = m
         return m
 
