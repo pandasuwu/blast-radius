@@ -2394,6 +2394,29 @@ def tpcds_region_ok(sel, rel, tree, oa, ob, why):
     return True
 
 
+def _comment_lines(text):
+    """Lines that hold only a comment or nothing (by the tokenizer, so '#' inside a string is not
+    a comment); None if the text does not tokenize."""
+    import io as _io
+    import tokenize
+    code = set()
+    try:
+        for tok in tokenize.generate_tokens(_io.StringIO(text).readline):
+            if tok.type not in (tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT,
+                                tokenize.DEDENT, tokenize.ENDMARKER):
+                code.update(range(tok.start[0], tok.end[0] + 1))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return None
+    return set(range(1, text.count("\n") + 2)) - code
+
+
+def _same_tree(old, new):
+    try:
+        return dump(ast.parse(old)) == dump(ast.parse(new))
+    except SyntaxError:
+        return False
+
+
 def tpcds_skippable(sel, budget=0.0):
     """True only if every change can reach test_execute_tpcds only through what the proxy compares,
     and the proxy dump of the patched source is identical to the pristine one."""
@@ -2407,6 +2430,10 @@ def tpcds_skippable(sel, budget=0.0):
             return False
         if rel.startswith("tests/fixtures/") and not rel.startswith("tests/fixtures/optimizer/tpc-ds/"):
             continue  # data the test never opens
+        if rel.endswith(".py") and rel in sel.patched and rel.startswith(("sqlglot/", "tests/")):
+            old = sel.read_src(rel)
+            if old is not None and _same_tree(old, sel.patched[rel]):
+                continue  # comments / formatting only: no code object changes
         if not (rel.startswith("sqlglot/") and rel.endswith(".py")) or rel not in sel.patched:
             return False
         old = sel.read_src(rel)
@@ -2414,7 +2441,11 @@ def tpcds_skippable(sel, budget=0.0):
             return False
         tree = ast.parse(old)
         _, regions = apply_hunks(old, f["hunks"])
-        for oa, ob, _na, _nb in regions:
+        oc, nc = _comment_lines(old), _comment_lines(sel.patched[rel])
+        for oa, ob, na, nb in regions:
+            if oc is not None and nc is not None and all(x in oc for x in range(oa, ob + 1)) \
+                    and all(x in nc for x in range(na, nb + 1)):
+                continue  # only comment / blank lines removed and added here
             if not tpcds_region_ok(sel, rel, tree, oa, ob, why):
                 return False
     # a patch can make the optimizer very slow: cap the check's wall clock (a timeout keeps the test)
@@ -2643,7 +2674,7 @@ VERIFY_HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")  # third-pa
 VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET", "140"))  # wall clock since start
 # Off by default: on the practice board v5.7 verified 1 commit clean (-2.0 s simulated) for +2.4 s CPU
 # (zygote 0.6 s, ~0.4 s per check; only ~13-20% of checks end in "all pass"). BR_VERIFY=1 turns it on.
-VERIFY_ON = os.environ.get("BR_VERIFY") == "1"
+VERIFY_ON = os.environ.get("BR_VERIFY", "1") == "1"
 
 
 class Zygote:
