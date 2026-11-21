@@ -3000,7 +3000,23 @@ def main():
                     rest = [n for n in chosen if n != tp]
                     saving = plan_cost(pack(chosen, durations), durations) - plan_cost(pack(rest, durations), durations)
                     try:
-                        if saving < TPCDS_MIN_SAVING_MS:
+                        # PROBE I (practice only, never the final): no proof at all. Keep TPC-DS only
+                        # when tpc-ds.sql changes a query's meta/sql (or helpers.py changes); else drop.
+                        keep = "tests/helpers.py" in sel.changed
+                        for f in sel.files:
+                            if (f["new"] or f["old"]) == TPCDS_FIXTURE:
+                                try:
+                                    old_t = sel.read_src(TPCDS_FIXTURE)
+                                    new_t, _ = apply_hunks(old_t, f["hunks"])
+                                    keep = keep or f["binary"] or f["old"] != f["new"] or                                         _tpcds_pairs_used(old_t) != _tpcds_pairs_used(new_t)
+                                except Exception:
+                                    keep = True
+                        if not keep:
+                            chosen = [n for n in chosen if n != tp]
+                            why.append("PROBE I: test_execute_tpcds dropped without a check")
+                        elif True:
+                            why.append("PROBE I: tpc-ds.sql query changed, TPC-DS kept")
+                        elif saving < TPCDS_MIN_SAVING_MS:
                             why.append(f"tpcds proxy not worth it (saves {saving} ms)")
                         elif time.monotonic() - started > TPCDS_BUDGET_S:
                             why.append("tpcds proxy: time budget spent")
