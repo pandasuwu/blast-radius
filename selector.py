@@ -1161,6 +1161,121 @@ class Selector:
         mod, qual = ck.split(":", 1)
         return dotted == f"{mod}.{qual}" or dotted.endswith("." + qual)
 
+    def derived_attrs(self, rel, line):
+        """Attributes of the class being created that a metaclass method derives from the value it
+        reads at `rel:line`, by a forward data/control-flow pass over that method; None whenever
+        the value could go anywhere else (a call, a return, a subscript store, an unknown object).
+        A mutating call such as klass.X.setdefault(...) counts only if the method assigned klass.X
+        unconditionally before (so X is the new class's own object, not a dict shared with a base)."""
+        key = ("derived", rel, line)
+        if key in self.memo:
+            return self.memo[key]
+        self.memo[key] = None
+        text = self.read_src(rel)
+        if text is None:
+            return None
+        tree = ast.parse(text)
+        fn = None
+        for n in ast.walk(tree):
+            if isinstance(n, FUNC_TYPES) and n.lineno <= line <= n.end_lineno and n.name in ("__new__", "__init__"):
+                if fn is None or n.lineno > fn.lineno:
+                    fn = n
+        if fn is None:
+            return None
+        # the new class: `X = super().__new__(...)` / `type.__new__` in __new__, the first parameter in __init__
+        klass = set()
+        if fn.name == "__init__" and fn.args.args:
+            klass.add(fn.args.args[0].arg)
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Attribute) \
+                    and n.value.func.attr == "__new__":
+                klass |= {x.id for x in n.targets if isinstance(x, ast.Name)}
+        if not klass:
+            return None
+        own = set()  # klass attributes assigned unconditionally at the method's top level
+        stmts = []  # (stmt, enclosing compound statements) in source order
+
+        def walk(body, enclosing):
+            for s in body:
+                stmts.append((s, enclosing))
+                for f in BLOCK_FIELDS:
+                    sub = getattr(s, f, None) or []
+                    sub = [b for x in sub for b in (x.body if isinstance(x, ast.ExceptHandler) else [x])]
+                    if sub and isinstance(sub[0], ast.stmt):
+                        walk(sub, enclosing + [s])
+        walk(fn.body, [])
+
+        def names(node):
+            return {x.id for x in ast.walk(node) if isinstance(x, ast.Name)} if node is not None else set()
+
+        def klass_attr_of(node):  # klass.A -> "A"
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in klass:
+                return node.attr
+            return None
+
+        start = None
+        for i, (s, enc) in enumerate(stmts):
+            if not enc and isinstance(s, ast.Assign):
+                for tg in s.targets:
+                    a = klass_attr_of(tg)
+                    if a and (start is None):
+                        own.add(a)
+            if first_line(s) <= line <= s.end_lineno and not isinstance(s, (ast.If, ast.For, ast.While, ast.With, ast.Try)):
+                start = i
+                break
+        if start is None:
+            return None
+        s0 = stmts[start][0]
+        tainted, derived = set(), set()
+        if not isinstance(s0, ast.Assign):
+            return None
+        for tg in s0.targets:
+            if isinstance(tg, ast.Name):
+                tainted.add(tg.id)
+            elif klass_attr_of(tg):
+                derived.add(klass_attr_of(tg))
+            else:
+                return None
+        for s, enc in stmts[start + 1:]:
+            if not enc and isinstance(s, ast.Assign):
+                for tg in s.targets:
+                    if klass_attr_of(tg):
+                        own.add(klass_attr_of(tg))
+            ctrl = any(names(getattr(e, "test", None)) & tainted or names(getattr(e, "iter", None)) & tainted
+                       for e in enc)
+            if isinstance(s, (ast.If, ast.While)):
+                continue  # their bodies are visited as statements of their own, with `enc`
+            if isinstance(s, ast.For):
+                if names(s.iter) & tainted or ctrl:
+                    tainted |= names(s.target)
+                continue
+            if isinstance(s, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                if not (names(s.value) & tainted or ctrl):
+                    continue
+                targets = s.targets if isinstance(s, ast.Assign) else [s.target]
+                for tg in targets:
+                    if isinstance(tg, ast.Name):
+                        tainted.add(tg.id)
+                    elif klass_attr_of(tg):
+                        derived.add(klass_attr_of(tg))
+                    else:
+                        return None
+                continue
+            uses = set().union(*(names(x) for x in ast.iter_child_nodes(s))) if not isinstance(s, ast.Pass) else set()
+            if not (uses & tainted or ctrl):
+                continue
+            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call) and isinstance(s.value.func, ast.Attribute):
+                a = klass_attr_of(s.value.func.value)
+                if a and a in own:
+                    derived.add(a)  # klass.A.method(...): mutates the new class's own A
+                    # its read of klass.A there only fetches the object to mutate, not a value
+                    # that flows elsewhere: class_attr skips that read for A
+                    self.memo.setdefault("mutation_reads", set()).add((rel, s.lineno, a))
+                    continue
+            return None  # the value reaches something this pass does not follow
+        self.memo[key] = derived
+        return derived
+
     def class_attr(self, ck, name, depth=0, added=False):
         """Tests that can observe a change of attribute `name` of class `ck`."""
         key = ("ca", ck, name, added)
@@ -1181,7 +1296,10 @@ class Selector:
         attrpos = self.idx.get("attrpos", ())
         direct = 0
         if use_prof:
+            skip = self.memo.get("mutation_reads", set())
             for prel, pline, imp, sigs in self.idx["attrprof"].get(name, ()):
+                if (prel, pline, name) in skip:
+                    continue  # the receiver of a derivation's mutating call (see derived_attrs)
                 for k in imp:
                     key_, _, loc = k.partition("@")
                     if key_ != "?" and key_ != ck:
@@ -1196,7 +1314,14 @@ class Selector:
                             # lives on that class, so its users can observe it
                             m |= self.class_users(ucls) | users
                             continue
-                        m |= self.unit_tests(u, depth + 1)
+                        derived = self.derived_attrs(prel, pline) if ucls else None
+                        if derived is not None:
+                            # a metaclass read it while creating ucls and only stored values derived
+                            # from it on ucls: tests that read those derived attributes can see it
+                            for d in derived:
+                                m |= self.class_attr(ucls, d, depth + 1)
+                        else:
+                            m |= self.unit_tests(u, depth + 1)
                         # another statement read it at import: it may now raise there too
                         m |= self.maybe_import_break(module_name(urel))
                         continue
