@@ -2316,8 +2316,11 @@ for i, (meta, sql, _) in enumerate(sqls):
         if est > BUDGET:
             verdict(ok=False, why=f"query {i}: loading its tables spent the budget")
         (strict, loose), took, table = run(pickle.loads(blob), names, tables)
-        if took > 3 * REF["sec"][str(i)] + 0.5:
-            verdict(ok=False, why=f"query {i}: execution much slower than pristine (slow patch?)")
+        # a patch may make a query slower but still correct (an optimization switched off): charge
+        # the real time to the budget instead of giving up on any single slow query
+        est += max(0.0, took - REF["sec"][str(i)])
+        if est > BUDGET:
+            verdict(ok=False, why=f"query {i}: execution needs more than the budget")
         if duck_changed or (strict != REF["res"][str(i)] and loose != REF["lres"][str(i)]):
             # rows or reference differ from pristine: decide exactly as the test does
             if not REF.get("dres"):
@@ -2374,7 +2377,8 @@ TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_MIN_SAVING_MS = 6000  # the check costs about 2-3 s of charged CPU before any execution
 TPCDS_MARGIN_S = 4.0  # CPU kept back from the saving for the comparison pass itself
 TPCDS_EXEC_CAP_S = 8.0  # most CPU spent executing changed queries for one commit
-TPCDS_EXEC_ALL_CAP_S = 16.0  # when the patch changes execution code: up to all 57 queries (~14.6 s)
+TPCDS_EXEC_ALL_CAP_S = 19.0  # when the patch changes execution code: up to all 57 queries
+TPCDS_EXEC_ALL_KEEP_S = 2.5  # saving kept back for the parse pass of an execution proof
 TPCDS_SLACK_S = 8.0  # wall-clock slack on top of margin + budget before a check is killed
 # wall clock; the run limit is 180 s (270 s in the final). Override only for big offline eval batches.
 TPCDS_BUDGET_S = float(os.environ.get("BR_TPCDS_BUDGET", "120"))
@@ -2592,7 +2596,8 @@ def tpcds_skippable(sel, budget=0.0):
         qs = None if exec_set is None else [i for i in range(exec_set.bit_length()) if exec_set >> i & 1]
         est = sum(v for k, v in sel.idx["tpcds_ref"]["sec"].items() if qs is None or int(k) in qs)
         # pay at most the saving minus the comparison pass and a 2 s net gain
-        budget = min(TPCDS_EXEC_ALL_CAP_S, getattr(sel, "tpcds_saving_s", 0.0) - TPCDS_MARGIN_S - 2.0)
+        # break-even: the parse pass (~2.5 s) plus execution must stay under the test's own time
+        budget = min(TPCDS_EXEC_ALL_CAP_S, getattr(sel, "tpcds_saving_s", 0.0) - TPCDS_EXEC_ALL_KEEP_S)
         if est > budget:
             why.append(f"tpcds check: executing {len(qs) if qs is not None else 'all'} queries would cost "
                        f"{est:.1f} s > {budget:.1f} s")
