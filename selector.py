@@ -88,6 +88,29 @@ def pack(numbers, durations):
     return best[1]
 
 
+def pack_free(numbers, tiers, durations):
+    """pack(), then fill idle worker time with free riders: tests from `tiers` (lists of test
+    numbers, most plausible first, then the rest of the suite) placed only where they keep
+    every worker at or under the busiest load. Cost and worker count are unchanged."""
+    workers = pack(numbers, durations)
+    if len(workers) < 2:
+        return workers
+    loads = [sum(durations[n] for n in w) for w in workers]
+    top = max(loads)
+    taken = set(numbers)
+    for tier in tiers:
+        for n in sorted((n for n in tier if n not in taken), key=lambda n: durations[n]):
+            if n in taken:
+                continue
+            i = loads.index(min(loads))
+            if loads[i] + durations[n] > top:
+                break  # tier sorted by duration: nothing later in it fits either
+            workers[i].append(n)
+            loads[i] += durations[n]
+            taken.add(n)
+    return workers
+
+
 # ----------------------------------------------------------------------------- AST helpers
 
 
@@ -650,7 +673,52 @@ def build_index():
     idx.update(units=units, refs=refs, classinfo=classinfo, modules=modules, walkers=walkers,
                core=core, rdeps=rdeps, importsens=importsens, mod_refmask=mod_refmask,
                attrnames=attrnames, toplevel=toplevel)
+    try:
+        idx["pool_groups"] = shared_pool_groups(m["tests"])
+    except Exception as e:
+        log("shared pool scan failed:", repr(e))
+        idx["pool_groups"] = []
     return idx
+
+
+def shared_pool_groups(test_ids):
+    """Test classes whose setUpClass makes one process pool shared by its tests. If a patch makes
+    a pool worker die, every later pool-using test of that class fails (BrokenProcessPool).
+    Returns, per class, the bit indices of its pool-using tests in suite (name) order."""
+    pos = {t: i for i, t in enumerate(test_ids)}
+    groups = []
+    for path in sorted((SRC / "tests").rglob("test_*.py")):
+        text = path.read_text(encoding="utf-8")
+        if "Pool" not in text:
+            continue
+        rel = path.relative_to(SRC).as_posix()
+        for cls in ast.walk(ast.parse(text)):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            meths = {f.name: f for f in cls.body if isinstance(f, FUNC_TYPES)}
+            setup = meths.get("setUpClass")
+            if setup is None:
+                continue
+            attrs = {t.attr for n in ast.walk(setup) if isinstance(n, ast.Assign)
+                     and isinstance(n.value, ast.Call) and "Pool" in ast.unparse(n.value.func)
+                     for t in n.targets if isinstance(t, ast.Attribute)}
+            if not attrs:
+                continue
+
+            def uses(f):
+                return {n.attr for n in ast.walk(f) if isinstance(n, ast.Attribute)
+                        and isinstance(n.value, ast.Name) and n.value.id in ("self", "cls")}
+            users = {name for name, f in meths.items() if uses(f) & attrs and name != "setUpClass"}
+            grew = True
+            while grew:
+                more = {name for name, f in meths.items() if name not in users and uses(f) & users}
+                users |= more
+                grew = bool(more)
+            order = [pos[f"{rel}::{cls.name}::{name}"] for name in sorted(users)
+                     if name.startswith("test") and f"{rel}::{cls.name}::{name}" in pos]
+            if order:
+                groups.append(order)
+    return groups
 
 
 # ----------------------------------------------------------------------------- patch parsing
@@ -1798,6 +1866,8 @@ class Selector:
         self.changed = {f["old"] or f["new"] for f in files} | {f["new"] or f["old"] for f in files}
         self.pending_imports = set()
         self.patched = {}
+        # free-rider tiers: later shared-pool tests, near lines, enclosing unit, module users
+        self.plausible = [0, 0, 0, 0]
         mask = 0
         for f in files:
             mask |= self.file_change(f)
@@ -1806,7 +1876,44 @@ class Selector:
             why.append(f"import check {sorted(self.pending_imports)[:3]} -> failed {failed[:3]}")
             for mod in failed:
                 mask |= self.import_break(mod)
+        for order in self.idx.get("pool_groups", ()):
+            # a pool worker killed by this change breaks the class's later pool tests
+            hit = [k for k, b in enumerate(order) if mask >> b & 1]
+            if hit:
+                for b in order[hit[0] + 1:]:
+                    self.plausible[0] |= 1 << b
         return mask, why
+
+    def note_plausible(self, rel, regions, reads):
+        """Record tests that are plausibly affected but not required. They ride for free in
+        worker time that the required tests leave idle (see pack_free); they never change cost."""
+        p = self.plausible
+        p[1] |= reads
+        if not rel:
+            return
+        if rel.endswith(".py"):
+            units = self.memo.get("all_units")
+            if units is None:
+                units = {}
+                for i, (urel, a, b, *_r) in enumerate(self.idx["units"]):
+                    units.setdefault(urel, []).append((a, b, i))
+                self.memo["all_units"] = units
+            for oa, ob, _na, _nb in regions:
+                lo, hi = (oa, ob) if ob >= oa else (ob, oa)
+                p[1] |= self.cover(rel, lo - 5, hi + 5)
+                best = None
+                for a, b, i in units.get(rel, ()):
+                    if a <= lo and hi <= b and (best is None or b - a < best[1] - best[0]):
+                        best = (a, b, i)
+                if best:
+                    p[2] |= self.cover(rel, best[0], best[1])
+                    ck = self.idx["units"][best[2]][6]
+                    if ck:
+                        p[2] |= self.class_users(ck)
+            if rel.startswith("sqlglot/"):
+                p[3] |= self.module_users(module_name(rel))
+        if rel.startswith("tests/"):
+            p[3] |= self.idx["testfiles"].get(rel, 0)
 
     def read_src(self, rel):
         try:
@@ -1838,6 +1945,10 @@ class Selector:
         is_py = rel.endswith(".py")
         top = rel.split("/")[0]
         reads = self.idx["opens"].get(rel, 0) | self.idx["code_opens"].get(rel, 0)
+        try:
+            self.note_plausible(old_rel, regions, reads)
+        except Exception as e:  # free riders are optional; never let them break selection
+            log("plausible:", repr(e))
         if top in ("sqlglot", "tests") and is_py and not rel.startswith("tests/fixtures/"):
             name = rel.rsplit("/", 1)[-1]
             if name == "conftest.py" or (rel.startswith("tests/") and name == "__init__.py"):
@@ -1980,27 +2091,40 @@ def main():
         to_number = [number_of.get(t) for t in map_tests]
     except Exception as e:
         log("selector unavailable, running everything:", repr(e))
+    def numbers(mask):
+        nums = []
+        i = 0
+        while mask:
+            if mask & 1 and to_number[i] is not None:
+                nums.append(to_number[i])
+            mask >>= 1
+            i += 1
+        return nums
+
     out = []
     for patch in patches:
         chosen = everything
+        tiers = []
         if sel is not None:
             try:
                 text = patch.read_text(encoding="utf-8", errors="replace")
                 mask, why = sel.select(text)
-                nums = set(always)
-                i = 0
-                while mask:
-                    if mask & 1 and to_number[i] is not None:
-                        nums.add(to_number[i])
-                    mask >>= 1
-                    i += 1
-                chosen = sorted(nums)
+                chosen = sorted(set(always) | set(numbers(mask)))
+                try:
+                    tiers = [numbers(m) for m in getattr(sel, "plausible", ())] + [everything]
+                except Exception as e:
+                    log(patch.stem, "free riders off:", repr(e))
                 log(patch.stem, len(chosen), "tests;", "; ".join(why)[:300])
             except Everything as e:
                 log(patch.stem, "everything:", e)
             except Exception as e:
                 log(patch.stem, "error, everything:", repr(e))
-        out.append(json.dumps({"commit": patch.stem, "workers": pack(chosen, durations)}, separators=(",", ":")))
+        try:
+            workers = pack_free(chosen, tiers, durations)
+        except Exception as e:
+            log(patch.stem, "free riders failed:", repr(e))
+            workers = pack(chosen, durations)
+        out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
 
