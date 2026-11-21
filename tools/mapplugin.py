@@ -104,8 +104,51 @@ def _switch(ctx):
         _cov.switch_context(ctx)
 
 
+class InlineProcessPool:
+    """Stand-in for ProcessPoolExecutor during mapping: runs work in this process so
+    coverage / open log / class log see it under the current test's context."""
+
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
+        self._init, self._initargs, self._ready = initializer, initargs, False
+
+    def _ensure_init(self):
+        if not self._ready:
+            self._ready = True
+            if self._init is not None:
+                self._init(*self._initargs)
+
+    def submit(self, fn, /, *args, **kwargs):
+        from concurrent.futures import Future
+        f = Future()
+        import pickle
+        try:
+            self._ensure_init()
+            # a real pool pickles work and results (sqlglot expressions go through serde)
+            fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
+            f.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
+        except BaseException as e:  # noqa: BLE001
+            f.set_exception(e)
+        return f
+
+    def map(self, fn, *iterables, timeout=None, chunksize=1):
+        return [self.submit(fn, *a).result() for a in zip(*iterables)]
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 def pytest_configure(config):
     global _cov
+    import concurrent.futures
+    import concurrent.futures.process
+    concurrent.futures.ProcessPoolExecutor = InlineProcessPool
+    concurrent.futures.process.ProcessPoolExecutor = InlineProcessPool
     import coverage
     _cov = coverage.Coverage.current()
     # import every sqlglot module now so import-time code lands in the "" context
