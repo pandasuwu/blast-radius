@@ -39,14 +39,20 @@ WORKER_COST_MS = 2000
 MAX_DEPTH = 4
 CHECK_FULL = os.environ.get("BR_FULLPARSE") == "1"
 IMPORT_CHECK = r"""
-import contextlib, importlib, importlib._bootstrap_external as be, io, json, os, sys
+import contextlib, importlib, importlib.util, importlib._bootstrap_external as be, io, json, os, sys
 d = json.load(sys.stdin)
 ov = {os.path.realpath(k): v.encode("utf-8") for k, v in d["overlay"].items()}
 _orig = be.FileLoader.get_data
 def _get_data(self, path):
     rp = os.path.realpath(path)
     if rp.endswith(".pyc"):
-        raise OSError("bytecode disabled: compile from (patched) source")
+        # pristine bytecode is fine, except for a file the overlay replaces: compile that from source
+        try:
+            src_rp = os.path.realpath(importlib.util.source_from_cache(path))
+        except Exception:
+            raise OSError("unknown bytecode: compile from source")
+        if src_rp in ov:
+            raise OSError("bytecode of a patched file: compile from source")
     return ov[rp] if rp in ov else _orig(self, path)
 be.FileLoader.get_data = _get_data
 sys.path.insert(0, d["src"])
@@ -2177,14 +2183,20 @@ print("STEPS " + " ".join(steps), file=sys.stderr)
 print(h.hexdigest(), len(sqls), n_exec, round(time.process_time() - t0, 2), file=sys.stderr)
 '''
 TPCDS_RUN = r"""
-import json, os, sys, importlib._bootstrap_external as be
+import json, os, sys, importlib.util, importlib._bootstrap_external as be
 d = json.load(sys.stdin)
 ov = {os.path.realpath(k): v.encode("utf-8") for k, v in d["overlay"].items()}
 _orig = be.FileLoader.get_data
 def _get_data(self, path):
     rp = os.path.realpath(path)
     if rp.endswith(".pyc"):
-        raise OSError("bytecode disabled: compile from (patched) source")
+        # pristine bytecode is fine, except for a file the overlay replaces: compile that from source
+        try:
+            src_rp = os.path.realpath(importlib.util.source_from_cache(path))
+        except Exception:
+            raise OSError("unknown bytecode: compile from source")
+        if src_rp in ov:
+            raise OSError("bytecode of a patched file: compile from source")
     return ov[rp] if rp in ov else _orig(self, path)
 be.FileLoader.get_data = _get_data
 sys.path.insert(0, d["src"])

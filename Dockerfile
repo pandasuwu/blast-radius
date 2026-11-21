@@ -5,6 +5,8 @@ WORKDIR /app
 COPY tools/fetch_sqlglot.py /app/fetch_sqlglot.py
 # pristine sqlglot at the pinned commit (the source every patch is applied to)
 RUN python /app/fetch_sqlglot.py /app/src && chmod -R a+rX /app/src
+# pristine bytecode (build time, not charged): patched files are still compiled from source
+RUN python -m compileall -q /app/src/sqlglot /app/src/tests
 COPY maps /app/maps
 COPY selector.py /app/selector.py
 # maps + reference index -> /app/index.pkl (build time, not charged)
