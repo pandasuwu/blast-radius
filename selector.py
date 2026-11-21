@@ -2410,6 +2410,24 @@ def _comment_lines(text):
     return set(range(1, text.count("\n") + 2)) - code
 
 
+TPCDS_FIXTURE = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+
+
+def _tpcds_pairs_used(text):
+    """What test_execute_tpcds takes from tpc-ds.sql: (meta, sql) of every pair, parsed exactly as
+    tests/helpers.load_sql_fixture_pairs does (its own pristine helper functions run on the text).
+    The third field, the expected optimized SQL, is only read by the optimizer's test_tpcds."""
+    ns = {"__name__": "tpcds_helpers", "__file__": str(SRC / "tests" / "helpers.py")}
+    exec(compile((SRC / "tests" / "helpers.py").read_text(encoding="utf-8"), "helpers", "exec"), ns)
+    statements = ns["_filter_comments"](text).split(";")
+    out = []
+    for i in range(0, len(statements), 2):
+        if i + 1 < len(statements):
+            sql, meta = ns["_extract_meta"](statements[i].strip())
+            out.append((repr(sorted(meta.items())), sql))
+    return out
+
+
 def _same_tree(old, new):
     try:
         return dump(ast.parse(old)) == dump(ast.parse(new))
@@ -2430,6 +2448,17 @@ def tpcds_skippable(sel, budget=0.0):
             return False
         if rel.startswith("tests/fixtures/") and not rel.startswith("tests/fixtures/optimizer/tpc-ds/"):
             continue  # data the test never opens
+        if rel == TPCDS_FIXTURE and f["old"] == f["new"] and not f["binary"]:
+            old = sel.read_src(rel)
+            if old is not None and "tests/helpers.py" not in sel.changed:
+                try:
+                    new, _ = apply_hunks(old, f["hunks"])
+                    if _tpcds_pairs_used(old) == _tpcds_pairs_used(new):
+                        why.append("tpc-ds.sql: only expected outputs changed (test_execute_tpcds reads meta + sql)")
+                        continue
+                except Exception as e:
+                    log("tpc-ds fixture compare failed:", repr(e))
+            return False
         if rel.endswith(".py") and rel in sel.patched and rel.startswith(("sqlglot/", "tests/")):
             old = sel.read_src(rel)
             if old is not None and _same_tree(old, sel.patched[rel]):
