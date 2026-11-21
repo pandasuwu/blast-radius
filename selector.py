@@ -1,14 +1,21 @@
-"""Blast Radius selector v2: coverage + AST-diff test selection.
+"""Blast Radius selector v3: coverage + region-level AST diff test selection.
 
 Build time (`python selector.py --prep`, run by the Dockerfile, not charged):
-  reads maps/maps.json.gz (coverage/open/class maps made by tools/ from the pinned
-  commit) and the pristine sqlglot source, builds a reference index (which
-  statements mention which names), and pickles everything to /app/index.pkl.
+  reads maps/maps.json.gz (per-test line coverage, opened files and instantiated classes,
+  made by tools/ from the pinned commit) and the pristine sqlglot source, builds a reference
+  index (which statements mention which names), an import graph, and pickles it all.
 
-Run time: for each /data/commits/*.patch, apply it in memory to the pristine
-source, diff old/new ASTs, turn every change into a set of tests through the maps,
-then pack the tests onto workers (LPT, best worker count). Anything unexpected
-falls back to running everything for that commit. stdlib only; logs to stderr.
+Run time: for each /data/commits/*.patch, apply it in memory to the pristine source. Each
+changed region is located in the old and new syntax trees; the innermost statements that
+differ decide the tests:
+  * inside a function:      tests that executed the changed (or neighbouring) lines
+  * class/module level:     tests that can read the changed names (coverage of the reading
+                            lines, users of the class, recursively through import-time code)
+  * could raise at import:  every test that imports the module (transitively)
+  * comments / docstrings:  nothing, unless a test reads the file
+  * fixtures / data files:  tests that opened the file
+Then the tests are packed onto workers (LPT, best worker count). Anything unexpected falls
+back to running everything for that commit. stdlib only; logs go to stderr.
 """
 
 import ast
@@ -69,15 +76,6 @@ def module_name(rel):
     return p[: -len(".__init__")] if p.endswith(".__init__") else p
 
 
-def strip_docstrings(tree):
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            b = node.body
-            if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and isinstance(b[0].value.value, str):
-                node.body = b[1:] or [ast.Pass()]
-    return tree
-
-
 def dump(node):
     return ast.dump(node, annotate_fields=False)
 
@@ -88,6 +86,29 @@ def first_line(node):
 
 
 DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+FUNC_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
+BLOCK_FIELDS = ("body", "orelse", "handlers", "finalbody", "cases")
+
+
+def is_docstring(s):
+    return isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str)
+
+
+def strip_docstrings(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            b = node.body
+            if b and is_docstring(b[0]):
+                node.body = b[1:] or [ast.Pass()]
+    return tree
+
+
+def is_type_checking(s):
+    if not isinstance(s, ast.If):
+        return False
+    t = s.test
+    return (isinstance(t, ast.Name) and t.id == "TYPE_CHECKING") or (
+        isinstance(t, ast.Attribute) and t.attr == "TYPE_CHECKING")
 
 
 def defined_names(stmt):
@@ -157,22 +178,31 @@ def chain(node):
     return None
 
 
+IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 # ----------------------------------------------------------------------------- reference index
 
 
 class RefIndexer:
-    """Collects, for one source file, every Name/Attribute reference that resolves to a
-    sqlglot/tests module-level or class-level object, with the statement unit it is in."""
+    """For one source file: every Name/Attribute/str-constant reference, with the statement
+    unit it is in. Resolved refs point at sqlglot/tests objects; unresolved attribute refs are
+    kept only for names some class body assigns (class attributes), as (name, None, 1)."""
 
-    def __init__(self, rel, tree, units, refs, classinfo):
+    def __init__(self, rel, tree, units, refs, classinfo, attrnames, imports):
         self.rel = rel
         self.mod = module_name(rel)
         self.pkg = self.mod if rel.endswith("__init__.py") else self.mod.rpartition(".")[0]
-        self.units, self.refs, self.classinfo = units, refs, classinfo
+        self.units, self.refs, self.classinfo, self.attrnames = units, refs, classinfo, attrnames
         self.aliases = {}
         self.toplevel = set()
         for s in tree.body:
             self.toplevel |= defined_names(s)
+        deps = imports.setdefault(self.mod, set())
+        tc_nodes = set()
+        for s in tree.body:
+            if is_type_checking(s):
+                tc_nodes |= {id(n) for n in ast.walk(s)}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
@@ -181,6 +211,8 @@ class RefIndexer:
                     else:
                         top = a.name.split(".")[0]
                         self.aliases[top] = top
+                    if id(node) not in tc_nodes:
+                        deps.add(a.name)
             elif isinstance(node, ast.ImportFrom):
                 base = node.module or ""
                 if node.level:
@@ -190,6 +222,10 @@ class RefIndexer:
                 for a in node.names:
                     if a.name != "*":
                         self.aliases[a.asname or a.name] = f"{base}.{a.name}"
+                    if id(node) not in tc_nodes:
+                        deps.add(base)
+                        if a.name != "*":
+                            deps.add(f"{base}.{a.name}")
         self.tree = tree
 
     def resolve_name(self, name, class_stack):
@@ -216,10 +252,9 @@ class RefIndexer:
 
     def _stmt(self, s, class_stack, in_func):
         if in_func:
-            # every expression of a statement inside a function runs at test time
             unit = None
             for field, value in ast.iter_fields(s):
-                if field in ("body", "orelse", "finalbody", "handlers", "cases"):
+                if field in BLOCK_FIELDS:
                     continue
                 for n in self._iter_nodes(value):
                     if unit is None:
@@ -227,7 +262,6 @@ class RefIndexer:
                     self._refs_in(n, class_stack, unit, True)
             self._children(s, class_stack, True)
             return
-        # import-time statement (module or class body)
         if class_stack:
             kind, owner = "c", f"{self.mod}:{class_stack[-1][0]}"
         else:
@@ -237,9 +271,15 @@ class RefIndexer:
         if isinstance(s, ast.ClassDef):
             q = f"{class_stack[-1][0]}.{s.name}" if class_stack else s.name
             classkey = f"{self.mod}:{q}"
-            self.classinfo[classkey] = (self.rel, first_line(s), s.end_lineno)
+            bases = []
+            for b in s.bases:
+                c = chain(b)
+                if c:
+                    r = self.resolve_name(c[0], class_stack)
+                    bases.append(".".join([r] + c[1:]) if r else ".".join(c))
+            self.classinfo[classkey] = (self.rel, first_line(s), s.end_lineno, tuple(bases))
         unit = self._unit(first_line(s), s.end_lineno, kind, owner, names, classkey)
-        if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(s, FUNC_TYPES):
             for n in s.decorator_list + [s.args] + ([s.returns] if s.returns else []):
                 self._refs_in(n, class_stack, unit, False)
             self._body(s.body, class_stack, True)
@@ -253,7 +293,7 @@ class RefIndexer:
             self._body(s.body, class_stack + [(q, cnames)], False)
         else:
             for field, value in ast.iter_fields(s):
-                if field in ("body", "orelse", "finalbody", "handlers", "cases"):
+                if field in BLOCK_FIELDS:
                     continue
                 for n in self._iter_nodes(value):
                     self._refs_in(n, class_stack, unit, False)
@@ -263,8 +303,6 @@ class RefIndexer:
         for field in ("body", "orelse", "finalbody"):
             self._body(getattr(s, field, []) or [], class_stack, in_func)
         for h in getattr(s, "handlers", []) or []:
-            if h.type is not None:
-                pass
             self._body(h.body, class_stack, in_func)
         for case in getattr(s, "cases", []) or []:
             self._body(case.body, class_stack, in_func)
@@ -278,33 +316,60 @@ class RefIndexer:
                 if isinstance(v, ast.AST):
                     yield v
 
+    def _add(self, name, u, resolved, kind):
+        self.refs.setdefault(name, []).append((u, resolved, kind))
+
     def _refs_in(self, node, class_stack, unit, runtime):
         stack = [(node, runtime, unit)]
         while stack:
             n, rt, u = stack.pop()
             if isinstance(n, ast.Lambda) and not rt:
-                # lambda body runs at test time; give it its own runtime unit
                 lu = self._unit(n.lineno, n.end_lineno, "f", None, ())
                 stack.append((n.body, True, lu))
                 continue
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if isinstance(n, FUNC_TYPES):
                 continue
             if isinstance(n, ast.Name):
+                if not isinstance(n.ctx, ast.Load):
+                    continue
                 r = self.resolve_name(n.id, class_stack)
                 if r and r.startswith(("sqlglot", "tests")):
-                    self.refs.setdefault(n.id, []).append((u, r, 0))
+                    self._add(n.id, u, r, 0)
+                continue
+            if isinstance(n, ast.Constant):
+                v = n.value
+                if isinstance(v, str) and v in self.attrnames:
+                    self._add(v, u, None, 2)
                 continue
             if isinstance(n, ast.Attribute):
+                if not isinstance(n.ctx, ast.Load):
+                    stack.append((n.value, rt, u))
+                    continue
                 c = chain(n.value)
+                full = None
                 if c:
                     base = self.resolve_name(c[0], class_stack)
                     if base and base.startswith(("sqlglot", "tests")):
                         full = ".".join([base] + c[1:])
-                        self.refs.setdefault(n.attr, []).append((u, full, 1))
+                if full is not None:
+                    self._add(n.attr, u, full, 1)
+                elif n.attr in self.attrnames:
+                    self._add(n.attr, u, None, 1)
                 stack.append((n.value, rt, u))
                 continue
             for child in ast.iter_child_nodes(n):
                 stack.append((child, rt, u))
+
+
+def class_attr_names(tree):
+    """Names assigned directly in class bodies (class attributes, not methods)."""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for s in node.body:
+                if isinstance(s, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    out |= defined_names(s)
+    return out
 
 
 # ----------------------------------------------------------------------------- index build
@@ -324,24 +389,113 @@ def build_index():
         "testfiles": {k: sets[v] for k, v in m["testfiles"].items()},
         "missing": m.get("missing", []),
     }
-    units, refs, classinfo = [], {}, {}
-    modules = set()
-    walkers = 0
+    trees = {}
+    attrnames = set()
     for root in ("sqlglot", "tests"):
         for p in sorted((SRC / root).rglob("*.py")):
             rel = p.relative_to(SRC).as_posix()
             if "/fixtures/" in rel:
                 continue
             text = p.read_text(encoding="utf-8")
-            modules.add(module_name(rel))
             try:
                 tree = ast.parse(text)
             except SyntaxError:
                 continue
-            RefIndexer(rel, tree, units, refs, classinfo).run()
-            if rel.startswith("tests/") and re.search(r"walk_packages|iter_modules|listdir|scandir|os\.walk|\.glob\(|rglob", text):
+            trees[rel] = (tree, text)
+            attrnames |= class_attr_names(tree)
+    units, refs, classinfo, imports = [], {}, {}, {}
+    walkers = 0
+    sens_units = []
+    modules = set()
+    toplevel = {}
+    for rel, (tree, text) in trees.items():
+        mod = module_name(rel)
+        modules.add(mod)
+        toplevel[mod] = {n for s in tree.body for n in defined_names(s)}
+        RefIndexer(rel, tree, units, refs, classinfo, attrnames, imports).run()
+        if rel.startswith("tests/"):
+            if re.search(r"walk_packages|iter_modules|listdir|scandir|os\.walk|\.glob\(|rglob", text):
                 walkers |= idx["testfiles"].get(rel, 0)
-    idx.update(units=units, refs=refs, classinfo=classinfo, modules=modules, walkers=walkers)
+            # import-sensitive test functions: local imports, subprocesses, importlib, sys.modules
+            for node in ast.walk(tree):
+                if isinstance(node, FUNC_TYPES):
+                    for sub in ast.walk(node):
+                        hit = isinstance(sub, (ast.Import, ast.ImportFrom)) and any(
+                            (a.name if isinstance(sub, ast.Import) else (sub.module or "")).startswith("sqlglot")
+                            for a in sub.names)
+                        if not hit and isinstance(sub, ast.Attribute) and sub.attr in ("import_module", "modules", "run", "Popen", "reload"):
+                            c = chain(sub)
+                            hit = bool(c) and c[0] in ("importlib", "sys", "subprocess")
+                        if hit:
+                            sens_units.append((rel, node.lineno, node.end_lineno))
+                            break
+    # map refs to package re-exports ("sqlglot.dialects.Athena") onto the defining module
+    pkg_reexport = {}
+    for mod, names in toplevel.items():
+        parts = mod.split(".")
+        for i in range(1, len(parts)):
+            pkg = ".".join(parts[:i])
+            for nm in names:
+                pkg_reexport.setdefault(f"{pkg}.{nm}", set()).add(mod)
+    mod_refunits = {}
+    for name, lst in refs.items():
+        for u, resolved, kind in lst:
+            if resolved is None or units[u][3] != "f":
+                continue
+            target = resolved
+            for _ in range(3):
+                if target in modules:
+                    mod_refunits.setdefault(target, set()).add(u)
+                    break
+                for dm in pkg_reexport.get(target, ()):
+                    mod_refunits.setdefault(dm, set()).add(u)
+                target = target.rpartition(".")[0]
+                if not target:
+                    break
+    # normalise import edges to known modules
+    deps = {}
+    for mod, ds in imports.items():
+        out = set()
+        for d in ds:
+            while d and d not in modules:
+                d = d.rpartition(".")[0]
+            if d and d != mod:
+                out.add(d)
+            # importing a.b.c also runs a and a.b
+            parts = d.split(".") if d else []
+            for i in range(1, len(parts)):
+                pm = ".".join(parts[:i])
+                if pm in modules and pm != mod:
+                    out.add(pm)
+        deps[mod] = out
+    core = set()
+    stack = ["sqlglot"]
+    while stack:
+        mm = stack.pop()
+        if mm in core:
+            continue
+        core.add(mm)
+        stack.extend(deps.get(mm, ()))
+    rdeps = {}
+    for mod, ds in deps.items():
+        for d in ds:
+            rdeps.setdefault(d, set()).add(mod)
+
+    def cover(rel, start, end):
+        d = lines.get(rel) or {}
+        mm = 0
+        for ln in range(start, end + 1):
+            s = d.get(ln)
+            if s:
+                mm |= s
+        return mm
+
+    importsens = walkers
+    for rel, a, b in sens_units:
+        importsens |= cover(rel, a, b)
+    idx.update(units=units, refs=refs, classinfo=classinfo, modules=modules, walkers=walkers,
+               core=core, rdeps=rdeps, importsens=importsens, mod_refunits=mod_refunits,
+               attrnames=attrnames, toplevel=toplevel)
     return idx
 
 
@@ -353,7 +507,7 @@ class PatchError(Exception):
 
 
 def parse_patch(text):
-    """-> list of dicts {old, new, hunks:[(ostart, olen, nstart, nlen, lines)], binary}"""
+    """-> list of dicts {old, new, hunks:[(ostart, olen, nstart, nlen, body, noeol)], binary}"""
     files = []
     cur = None
     lines = text.split("\n")
@@ -361,7 +515,7 @@ def parse_patch(text):
     while i < len(lines):
         line = lines[i]
         if line.startswith("diff --git "):
-            cur = {"old": None, "new": None, "hunks": [], "binary": False, "header": line}
+            cur = {"old": None, "new": None, "hunks": [], "binary": False}
             files.append(cur)
             mm = re.match(r"diff --git a/(.*) b/(.*)$", line)
             if mm:
@@ -370,7 +524,7 @@ def parse_patch(text):
             continue
         if line.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
             if cur is None or cur["hunks"]:
-                cur = {"old": None, "new": None, "hunks": [], "binary": False, "header": ""}
+                cur = {"old": None, "new": None, "hunks": [], "binary": False}
                 files.append(cur)
             o = line[4:].split("\t")[0].strip()
             n = lines[i + 1][4:].split("\t")[0].strip()
@@ -410,12 +564,9 @@ def parse_patch(text):
                 if tag in " +":
                     nc += 1
                 i += 1
-            # trailing "\ No newline" markers
-            noeol_new = noeol_old = False
+            noeol_new = False
             while i < len(lines) and lines[i].startswith("\\"):
-                if body and body[-1][0] == "-":
-                    noeol_old = True
-                else:
+                if not (body and body[-1][0] == "-"):
                     noeol_new = True
                 i += 1
             cur["hunks"].append((os_, ol, ns, nl, body, noeol_new))
@@ -425,18 +576,21 @@ def parse_patch(text):
 
 
 def apply_hunks(old_text, hunks):
+    """Apply hunks; returns (new_text, regions). Regions are (o_start, o_end, n_start, n_end)
+    in 1-based old/new line numbers; an empty side has end == start - 1 (insertion point)."""
     old = old_text.split("\n") if old_text else []
     trailing_nl = bool(old_text) and old_text.endswith("\n")
     if trailing_nl:
         old = old[:-1]
     out = []
+    regions = []
     pos = 0
     noeol = False
     for os_, ol, ns, nl, body, noeol_new in hunks:
         want = [t for tag, t in body if tag in " -"]
         start = os_ - 1 if ol else os_
         found = None
-        for delta in range(0, 200):
+        for delta in range(0, 400):
             for cand in ((start + delta,) if delta == 0 else (start + delta, start - delta)):
                 if cand >= pos and old[cand:cand + len(want)] == want:
                     found = cand
@@ -446,14 +600,34 @@ def apply_hunks(old_text, hunks):
         if found is None:
             raise PatchError("hunk does not apply")
         out.extend(old[pos:found])
-        out.extend(t for tag, t in body if tag in " +")
+        oline = found + 1
+        nline = len(out) + 1
+        k = 0
+        while k < len(body):
+            tag, t = body[k]
+            if tag == " ":
+                out.append(t)
+                oline += 1
+                nline += 1
+                k += 1
+                continue
+            o0, n0 = oline, nline
+            while k < len(body) and body[k][0] != " ":
+                tag, t = body[k]
+                if tag == "-":
+                    oline += 1
+                else:
+                    out.append(t)
+                    nline += 1
+                k += 1
+            regions.append((o0, oline - 1, n0, nline - 1))
         pos = found + len(want)
         noeol = noeol_new
     out.extend(old[pos:])
     text = "\n".join(out)
     if out and (trailing_nl or not old) and not (noeol and pos >= len(old)):
         text += "\n"
-    return text
+    return text, regions
 
 
 # ----------------------------------------------------------------------------- selection
@@ -463,13 +637,33 @@ class Everything(Exception):
     pass
 
 
+def overlaps(s, a, b):
+    f, e = first_line(s), s.end_lineno
+    if b < a:  # insertion before line a
+        return f < a <= e
+    return f <= b and a <= e
+
+
+def block_span(block):
+    return first_line(block[0]), max(s.end_lineno for s in block)
+
+
+def children(node):
+    for field in BLOCK_FIELDS:
+        v = getattr(node, field, None)
+        if v and isinstance(v, list) and hasattr(v[0], "lineno"):
+            yield field, v
+
+
+SAFE_LEAVES = (ast.Constant, ast.Lambda, ast.Pass)
+
+
 class Selector:
     def __init__(self, idx):
         self.idx = idx
         self.lines = idx["lines"]
         self.memo = {}
-        n = len(idx["tests"])
-        self.all = (1 << n) - 1
+        self.all = (1 << len(idx["tests"])) - 1
 
     # --- primitive lookups
     def cover(self, rel, start, end):
@@ -488,6 +682,14 @@ class Selector:
                     m |= s
         return m
 
+    def is_import_time(self, rel, start, end):
+        il = self.idx["importlines"].get(rel)
+        if not il:
+            return False
+        if end - start > len(il):
+            return any(start <= x <= end for x in il)
+        return any(x in il for x in range(start, end + 1))
+
     def class_users(self, ck):
         key = ("cu", ck)
         if key in self.memo:
@@ -495,7 +697,53 @@ class Selector:
         m = self.idx["classes"].get(ck, 0)
         info = self.idx["classinfo"].get(ck)
         if info:
-            m |= self.cover(*info)
+            m |= self.cover(info[0], info[1], info[2])
+        self.memo[key] = m
+        return m
+
+    def module_users(self, mod):
+        """Tests that run code from, instantiate a class of, or reference this module."""
+        key = ("mu", mod)
+        if key in self.memo:
+            return self.memo[key]
+        m = 0
+        for rel in (mod.replace(".", "/") + ".py", mod.replace(".", "/") + "/__init__.py"):
+            d = self.lines.get(rel)
+            if d:
+                for s in d.values():
+                    m |= s
+            m |= self.idx["testfiles"].get(rel, 0)
+        pref = mod + ":"
+        for ck, s in self.idx["classes"].items():
+            if ck.startswith(pref):
+                m |= s
+        for u in self.idx["mod_refunits"].get(mod, ()):
+            rel, a, b = self.idx["units"][u][:3]
+            m |= self.cover(rel, a, b)
+        self.memo[key] = m
+        return m
+
+    def import_break(self, mod):
+        """The module may now fail to import: every test that (transitively) imports it."""
+        key = ("ib", mod)
+        if key in self.memo:
+            return self.memo[key]
+        if mod in self.idx["core"] or not mod.startswith(("sqlglot", "tests")):
+            m = self.all
+        else:
+            seen, stack = set(), [mod]
+            while stack:
+                x = stack.pop()
+                if x in seen:
+                    continue
+                seen.add(x)
+                stack.extend(self.idx["rdeps"].get(x, ()))
+            m = self.idx["importsens"] | self.idx["walkers"]
+            for x in seen:
+                if x in self.idx["core"]:
+                    m = self.all
+                    break
+                m |= self.module_users(x)
         self.memo[key] = m
         return m
 
@@ -517,26 +765,6 @@ class Selector:
             m |= self.class_users(owner)
         return m
 
-    def module_users(self, mod):
-        """Every test that runs code from, or instantiates a class of, this module."""
-        key = ("mu", mod)
-        if key in self.memo:
-            return self.memo[key]
-        rel_py = mod.replace(".", "/") + ".py"
-        rel_init = mod.replace(".", "/") + "/__init__.py"
-        m = 0
-        for rel in (rel_py, rel_init):
-            d = self.lines.get(rel)
-            if d:
-                for s in d.values():
-                    m |= s
-        pref = mod + ":"
-        for ck, s in self.idx["classes"].items():
-            if ck.startswith(pref):
-                m |= s
-        self.memo[key] = m
-        return m
-
     def module_name(self, mod, name, depth=0):
         """Tests that can observe a change of module-level `name` in `mod`."""
         key = ("mn", mod, name)
@@ -545,8 +773,10 @@ class Selector:
         self.memo[key] = 0  # cycle guard
         m = 0
         full = f"{mod}.{name}"
-        for u, resolved, is_attr in self.idx["refs"].get(name, ()):
-            if is_attr:
+        for u, resolved, kind in self.idx["refs"].get(name, ()):
+            if resolved is None:
+                continue
+            if kind == 1:
                 ok = resolved == mod or resolved in self.idx["modules"]
             else:
                 ok = resolved == full or (resolved.endswith("." + name) and resolved.startswith("sqlglot"))
@@ -555,28 +785,82 @@ class Selector:
         self.memo[key] = m
         return m
 
+    def is_subclass(self, dotted, ck, seen=None):
+        """Static check: does the class at `dotted` have class `ck` among its ancestors?"""
+        mod, qual = ck.split(":", 1)
+        target = f"{mod}.{qual}"
+        if dotted == target or dotted.endswith("." + qual):
+            return True
+        seen = seen or set()
+        for k, info in self.idx["classinfo"].items():
+            m2, q2 = k.split(":", 1)
+            if f"{m2}.{q2}" == dotted or (dotted.endswith("." + q2) and dotted.rsplit(".", 1)[-1] == q2.rsplit(".", 1)[-1]):
+                if k in seen:
+                    continue
+                seen.add(k)
+                for b in info[3]:
+                    if self.is_subclass(b, ck, seen):
+                        return True
+        return False
+
     def class_attr(self, ck, name, depth=0):
         """Tests that can observe a change of attribute `name` of class `ck`."""
         key = ("ca", ck, name)
         if key in self.memo:
             return self.memo[key]
         self.memo[key] = 0
+        users = self.class_users(ck)
         mod, qual = ck.split(":", 1)
         dotted = f"{mod}.{qual}"
-        m = self.class_users(ck)
-        for u, resolved, is_attr in self.idx["refs"].get(name, ()):
-            if is_attr:
-                ok = resolved == dotted or resolved.endswith("." + qual)
-            else:
-                ok = resolved == f"{dotted}.{name}"
-            if ok:
+        runtime = 0
+        m = 0
+        unsafe = depth >= MAX_DEPTH
+        for u, resolved, kind in self.idx["refs"].get(name, ()):
+            urel, a, b, ukind = self.idx["units"][u][:4]
+            if ukind == "f":
+                if self.is_import_time(urel, a, b):
+                    if resolved is None or self.is_subclass(resolved.rpartition(".")[0], ck) or kind == 0:
+                        unsafe = True
+                    else:
+                        m |= self.cover(urel, a, b)
+                else:
+                    runtime |= self.cover(urel, a, b)
+                continue
+            # import-time reference in a class body / module statement
+            if resolved is None:
+                unsafe = True
+            elif kind == 0:
+                if resolved == f"{dotted}.{name}":
+                    m |= self.unit_tests(u, depth)
+            elif kind == 1 and self.is_subclass(resolved, ck):
                 m |= self.unit_tests(u, depth)
+        if name.endswith("_sql") and not name.startswith("_"):
+            # Generator dispatch: dir(cls) -> {expr key: method}; used for that expression type
+            key_ = name[:-4]
+            exp_users = 0
+            for c, s in self.idx["classes"].items():
+                if c.startswith("sqlglot.expressions") and c.rsplit(":", 1)[-1].rsplit(".", 1)[-1].lower() == key_.replace("_", ""):
+                    exp_users |= s
+                elif c.startswith("sqlglot.expressions") and c.rsplit(":", 1)[-1].lower() == key_:
+                    exp_users |= s
+            m |= exp_users & (users | runtime) if exp_users else users
+            m |= runtime & users
+        elif unsafe:
+            # read at import time (e.g. a metaclass deriving tables onto the outer dialect class)
+            m |= users
+            outer = qual
+            while "." in outer:
+                outer = outer.rsplit(".", 1)[0]
+                m |= self.class_users(f"{mod}:{outer}")
+        else:
+            m |= users & runtime
         self.memo[key] = m
         return m
 
     # --- python diff
-    def py_change(self, rel, old, new, why):
+    def py_change(self, rel, old, new, regions, why):
         mod = module_name(rel)
+        self.rel, self.mod = rel, mod
         try:
             told = ast.parse(old)
         except SyntaxError:
@@ -585,30 +869,82 @@ class Selector:
             tnew = ast.parse(new)
         except SyntaxError:
             why.append(f"{rel}: syntax error")
-            if rel.startswith("tests/"):
-                return self.idx["testfiles"].get(rel, 0) | self.importers_of_test(rel)
-            raise Everything("syntax error")
-        spans = {}
-        for node in ast.walk(told):
-            if isinstance(node, DEF_TYPES):
-                spans[id(node)] = (first_line(node), node.end_lineno)
-        strip_docstrings(told)
-        strip_docstrings(tnew)
-        if dump(told) == dump(tnew):
-            m = self.idx["opens"].get(rel, 0)
-            why.append(f"{rel}: comments/docstrings only")
-            return m
-        self.rel, self.mod, self.spans = rel, mod, spans
-        return self.body(told.body, tnew.body, None, why)
-
-    def importers_of_test(self, rel):
-        # a test module imported by other test modules (e.g. tests/dialects/test_dialect.py)
-        mod = module_name(rel)
+            return self.import_break(mod)
+        self.old_text = old
         m = 0
-        for ck, s in self.idx["classes"].items():
-            if ck.startswith(mod + ":"):
-                m |= s
-        return m | self.module_users(mod)
+        noop = True
+        for oa, ob, na, nb in regions:
+            r, changed = self.region(told.body, tnew.body, oa, ob, na, nb, ("m", None), None, True)
+            m |= r
+            noop = noop and not changed
+        if noop:
+            why.append(f"{rel}: comments/docstrings/whitespace only")
+            return self.idx["opens"].get(rel, 0)
+        return m
+
+    def region(self, oblock, nblock, oa, ob, na, nb, ctx, parent, docblock):
+        O = [s for s in oblock if overlaps(s, oa, ob)]
+        N = [s for s in nblock if overlaps(s, na, nb)]
+        if len(O) == 1 and len(N) == 1 and type(O[0]) is type(N[0]):
+            o, n = O[0], N[0]
+            ochild = dict(children(o))
+            nchild = dict(children(n))
+            for field, oblk in ochild.items():
+                nblk = nchild.get(field)
+                if not nblk:
+                    continue
+                of, oe = block_span(oblk)
+                nf, ne = block_span(nblk)
+                oin = (of <= oa and ob <= oe) if ob >= oa else (of < oa <= oe)
+                nin = (nf <= na and nb <= ne) if nb >= na else (nf < na <= ne)
+                if not (oin and nin):
+                    continue
+                if isinstance(o, ast.ClassDef) and ctx[0] != "f":
+                    q = f"{ctx[1].split(':', 1)[1]}.{o.name}" if ctx[0] == "c" else o.name
+                    nctx = ("c", f"{self.mod}:{q}")
+                elif isinstance(o, FUNC_TYPES) and ctx[0] != "f":
+                    nctx = ("f", o, ctx)
+                else:
+                    nctx = ctx
+                return self.region(oblk, nblk, oa, ob, na, nb, nctx, o,
+                                   isinstance(o, DEF_TYPES) and field == "body")
+        # final level
+        Od = [s for s in O if not (docblock and oblock and s is oblock[0] and is_docstring(s))]
+        Nd = [s for s in N if not (docblock and nblock and s is nblock[0] and is_docstring(s))]
+        if [dump(x) for x in Od] == [dump(x) for x in Nd]:
+            return 0, False
+        if ctx[0] == "f":
+            return self.func_region(O, N, oblock, oa, ob, ctx, parent), True
+        ck = ctx[1] if ctx[0] == "c" else None
+        return self.body(Od, Nd, ck), True
+
+    def func_region(self, O, N, oblock, oa, ob, ctx, parent):
+        rel = self.rel
+        m = 0
+        spans = [(first_line(s), s.end_lineno) for s in O]
+        if not O or len(N) > len(O):
+            # inserted statements: tests that reached the insertion point
+            prev = [s for s in oblock if s.end_lineno < (oa if ob < oa else oa)]
+            nxt = [s for s in oblock if first_line(s) > (ob if ob >= oa else oa - 1)]
+            if prev:
+                spans.append((first_line(prev[-1]), prev[-1].end_lineno))
+            if nxt:
+                spans.append((first_line(nxt[0]), nxt[0].end_lineno))
+            if not prev and parent is not None:
+                spans.append((first_line(parent), parent.end_lineno))
+        for a, b in spans:
+            m |= self.cover(rel, a, b)
+        func, owner_ctx = ctx[1], ctx[2]
+        if any(self.is_import_time(rel, a, b) for a, b in spans):
+            ck = owner_ctx[1] if owner_ctx[0] == "c" else None
+            self.why.append(f"import-time code in {func.name}")
+            m |= self.import_break(self.mod)
+            m |= self.name_change(func.name, ck)
+            if ck:
+                m |= self.class_users(ck)
+        else:
+            self.why.append(f"lines in {func.name}")
+        return m
 
     @staticmethod
     def key(s):
@@ -620,7 +956,7 @@ class Selector:
             return ("as", (dump(s.target),))
         return None
 
-    def body(self, olds, news, ck, why):
+    def body(self, olds, news, ck):
         od = [dump(s) for s in olds]
         nd = [dump(s) for s in news]
         m = 0
@@ -640,12 +976,12 @@ class Selector:
                             break
                 if partner is not None:
                     used.add(partner)
-                    m |= self.pair(o, n_block[partner], ck, why)
+                    m |= self.pair(o, n_block[partner], ck)
                 else:
-                    m |= self.stmt(o, None, ck, why)
+                    m |= self.stmt(o, None, ck)
             for jx, n in enumerate(n_block):
                 if jx not in used:
-                    m |= self.stmt(None, n, ck, why)
+                    m |= self.stmt(None, n, ck)
         return m
 
     def name_change(self, name, ck):
@@ -653,36 +989,135 @@ class Selector:
             return self.class_attr(ck, name)
         return self.module_name(self.mod, name)
 
-    def pair(self, o, n, ck, why):
+    # --- import-time safety
+    def safe_expr(self, e):
+        for n in ast.walk(e):
+            if isinstance(n, ast.Lambda):
+                continue
+            if isinstance(n, (ast.Call, ast.Subscript, ast.Await, ast.Yield, ast.YieldFrom, ast.NamedExpr, ast.Compare)):
+                if not self.inside_lambda(e, n):
+                    return False
+            if isinstance(n, ast.BinOp) and not (isinstance(n.left, ast.Constant) and isinstance(n.right, ast.Constant)):
+                if not self.inside_lambda(e, n):
+                    return False
+            if isinstance(n, (ast.Name, ast.Attribute)) and isinstance(getattr(n, "ctx", None), ast.Load):
+                c = chain(n)
+                if c and ".".join(c) not in self.old_text and not self.inside_lambda(e, n):
+                    return False
+        return True
+
+    @staticmethod
+    def inside_lambda(root, node):
+        for lam in ast.walk(root):
+            if isinstance(lam, ast.Lambda) and lam is not node:
+                for x in ast.walk(lam.body):
+                    if x is node:
+                        return True
+                for x in ast.walk(lam.args):
+                    if x is node:
+                        return False
+        return False
+
+    def safe_pair(self, o, n):
+        """Can replacing import-time statement o by n (either may be None) raise at import?"""
+        if n is None:
+            return True  # removal itself cannot raise; readers are found through the name rules
+        if o is None:
+            if isinstance(n, (ast.Pass,)) or is_docstring(n):
+                return True
+            if isinstance(n, FUNC_TYPES):
+                return not n.decorator_list and all(self.safe_expr(d) for d in n.args.defaults + n.args.kw_defaults if d is not None)
+            if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None:
+                return self.safe_expr(n.value)
+            return False
+        return self.safe_diff(o, n)
+
+    def safe_diff(self, a, b):
+        if type(a) is not type(b):
+            if isinstance(b, ast.AST):
+                return self.safe_expr(b) if isinstance(b, ast.expr) else False
+            return False
+        if isinstance(a, ast.Lambda):
+            return dump(a.args) == dump(b.args) and all(
+                self.safe_expr(d) for d in b.args.defaults if d is not None)
+        if isinstance(a, ast.Constant):
+            return True
+        if isinstance(a, (ast.Dict,)):
+            ok = {(dump(k) if k else "**", dump(v)) for k, v in zip(a.keys, a.values)}
+            for k, v in zip(b.keys, b.values):
+                pair = (dump(k) if k else "**", dump(v))
+                if pair in ok:
+                    continue
+                # changed value of an existing key, or new entry
+                if not ((k is None or self.safe_expr(k)) and self.safe_expr(v)):
+                    olds = [ov for ok_, ov in zip(a.keys, a.values) if ok_ is not None and k is not None and dump(ok_) == dump(k)]
+                    if not (olds and self.safe_diff(olds[0], v)):
+                        return False
+            return True
+        if isinstance(a, (ast.Set, ast.List, ast.Tuple)):
+            ok = {dump(x) for x in a.elts}
+            return all(dump(x) in ok or self.safe_expr(x) for x in b.elts)
+        if isinstance(a, ast.AST):
+            for field in a._fields:
+                va, vb = getattr(a, field, None), getattr(b, field, None)
+                if isinstance(va, list) or isinstance(vb, list):
+                    va, vb = va or [], vb or []
+                    if len(va) != len(vb):
+                        if field in ("body", "orelse", "finalbody") and isinstance(a, ast.stmt):
+                            return False
+                        return all(self.safe_expr(x) if isinstance(x, ast.expr) else False for x in vb
+                                   if dump(x) not in {dump(y) for y in va})
+                    for x, y in zip(va, vb):
+                        if isinstance(x, ast.AST) or isinstance(y, ast.AST):
+                            if dump(x) != dump(y) and not self.safe_diff(x, y):
+                                return False
+                        elif x != y:
+                            return False
+                elif isinstance(va, ast.AST) or isinstance(vb, ast.AST):
+                    if va is None or vb is None:
+                        if vb is not None and not (isinstance(vb, ast.expr) and self.safe_expr(vb)):
+                            return False
+                    elif dump(va) != dump(vb) and not self.safe_diff(va, vb):
+                        return False
+                elif va != vb:
+                    # operator/identifier field changed (e.g. Sub -> Add): may raise
+                    if isinstance(a, ast.expr) and isinstance(a, ast.Name):
+                        return self.safe_expr(b)
+                    return False
+            return True
+        return a == b
+
+    def pair(self, o, n, ck):
         if isinstance(o, ast.ClassDef) and isinstance(n, ast.ClassDef):
             q = f"{ck.split(':', 1)[1]}.{o.name}" if ck else o.name
             new_ck = f"{self.mod}:{q}"
             m = 0
             if [dump(x) for x in o.bases + o.keywords + o.decorator_list] != [dump(x) for x in n.bases + n.keywords + n.decorator_list]:
-                why.append(f"class header {new_ck}")
-                m |= self.class_users(new_ck) | self.name_change(o.name, ck)
-                m |= self.subclass_registry(o, n)
-            return m | self.body(o.body, n.body, new_ck, why)
-        if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            start, end = self.spans[id(o)]
-            m = self.cover(self.rel, start, end)
+                self.why.append(f"class header {new_ck}")
+                m |= self.class_users(new_ck) | self.name_change(o.name, ck) | self.subclass_registry(o, n)
+                m |= self.import_break(self.mod)
+            return m | self.body(o.body, n.body, new_ck)
+        if isinstance(o, FUNC_TYPES) and isinstance(n, FUNC_TYPES):
+            m = self.cover(self.rel, first_line(o), o.end_lineno)
             where = f"{ck or self.mod}.{o.name}"
             sig_o = [dump(x) for x in o.decorator_list + [o.args] + ([o.returns] if o.returns else [])]
             sig_n = [dump(x) for x in n.decorator_list + [n.args] + ([n.returns] if n.returns else [])]
-            body_lines = set(range(o.body[0].lineno, end + 1)) if o.body else set()
-            import_time = bool(body_lines & self.idx["importlines"].get(self.rel, set()))
+            body_import = o.body and self.is_import_time(self.rel, o.body[0].lineno, o.end_lineno)
             if sig_o != sig_n or type(o) is not type(n):
-                why.append(f"signature {where}")
+                self.why.append(f"signature {where}")
                 m |= self.name_change(o.name, ck)
-            if import_time:
-                why.append(f"import-time function {where}")
-                m |= self.name_change(o.name, ck)
+                if [dump(x) for x in o.decorator_list] != [dump(x) for x in n.decorator_list] or not all(
+                        self.safe_expr(d) for d in n.args.defaults + n.args.kw_defaults if d is not None):
+                    m |= self.import_break(self.mod)
+            if body_import:
+                self.why.append(f"import-time function {where}")
+                m |= self.name_change(o.name, ck) | self.import_break(self.mod)
                 if ck:
-                    m |= self.class_users(ck) | self.module_name(self.mod, ck.split(":", 1)[1].split(".")[0])
+                    m |= self.class_users(ck)
             else:
-                why.append(f"function {where}")
+                self.why.append(f"function {where}")
             return m
-        return self.stmt(o, n, ck, why)
+        return self.stmt(o, n, ck)
 
     def subclass_registry(self, o, n):
         """Bases changed/added/removed: users of every base class (registries, MRO)."""
@@ -699,33 +1134,44 @@ class Selector:
                             m |= s
         return m
 
-    def stmt(self, o, n, ck, why):
+    def stmt(self, o, n, ck):
         names = defined_names(o) | defined_names(n)
         m = 0
         if o is not None:
             m |= self.cover(self.rel, first_line(o), o.end_lineno)
-            if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                m |= self.cover(self.rel, *self.spans[id(o)])
         for node in (o, n):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 self.check_import(node)
             if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
                 raise Everything("star import changed")
+        if not self.safe_pair(o, n):
+            self.why.append(f"may raise at import ({ck or self.mod})")
+            m |= self.import_break(self.mod)
+        if (o is None or n is None) and names and not ck:
+            # removing a module-level name that import-time code reads raises NameError
+            if n is None and any(self.idx["units"][u][3] != "f" for nm in names
+                                 for u, r, k in self.idx["refs"].get(nm, ()) if r):
+                m |= self.import_break(self.mod)
         if isinstance(o or n, ast.ClassDef) and (o is None or n is None):
             m |= self.subclass_registry(o, n)
-        if ck and isinstance(o or n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # added/removed method: dynamic dispatch (getattr(self, f"{key}_sql")) and overrides
-            m |= self.class_users(ck)
+        if ck and isinstance(o or n, FUNC_TYPES):
+            m |= self.method_added_removed(ck, (o or n).name)
         if not names:
-            why.append(f"stmt without names in {ck or self.mod}")
+            self.why.append(f"stmt without names in {ck or self.mod}")
             return m | (self.class_users(ck) if ck else self.module_users(self.mod))
-        why.append(f"names {sorted(names)[:5]} in {ck or self.mod}")
+        self.why.append(f"names {sorted(names)[:4]} in {ck or self.mod}")
         for name in names:
             m |= self.name_change(name, ck)
         return m
 
+    def method_added_removed(self, ck, name):
+        """A method appeared/vanished: overrides change for every instance of the class,
+        except generator *_sql methods, which only matter for their expression type."""
+        if name.endswith("_sql") and not name.startswith("_"):
+            return self.class_attr(ck, name)
+        return self.class_users(ck)
+
     def check_import(self, node):
-        """A new import of a sqlglot module that does not exist breaks the module."""
         mods = []
         if isinstance(node, ast.Import):
             mods = [a.name for a in node.names]
@@ -737,24 +1183,24 @@ class Selector:
 
     # --- per commit
     def select(self, patch_text):
-        why = []
+        self.why = why = []
         files = parse_patch(patch_text)
         if not files:
             return 0, ["empty patch"]
         self.new_modules = {module_name(f["new"]) for f in files if f["new"] and f["new"].endswith(".py")}
         mask = 0
         for f in files:
-            mask |= self.file_change(f, why)
+            mask |= self.file_change(f)
         return mask, why
 
     def read_src(self, rel):
-        p = SRC / rel
         try:
-            return p.read_text(encoding="utf-8")
+            return (SRC / rel).read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
 
-    def file_change(self, f, why):
+    def file_change(self, f):
+        why = self.why
         old_rel, new_rel = f["old"], f["new"]
         rel = new_rel or old_rel
         if rel is None:
@@ -764,41 +1210,37 @@ class Selector:
                 raise Everything("binary " + rel)
             return 0
         if old_rel and new_rel and old_rel != new_rel:
-            # rename: removal of old + addition of new
-            return self.file_change({**f, "new": None, "hunks": []}, why) | self.file_change({**f, "old": None}, why)
+            return self.file_change({**f, "new": None, "hunks": []}) | self.file_change({**f, "old": None})
         old_text = self.read_src(old_rel) if old_rel else None
         if old_rel and old_text is None:
             raise Everything("unknown file " + old_rel)
         if new_rel:
-            new_text = apply_hunks(old_text or "", f["hunks"])
+            new_text, regions = apply_hunks(old_text or "", f["hunks"])
         else:
-            new_text = None
+            new_text, regions = None, []
         is_py = rel.endswith(".py")
         top = rel.split("/")[0]
         reads = self.idx["opens"].get(rel, 0) | self.idx["code_opens"].get(rel, 0)
-        if top in ("sqlglot", "tests") and is_py:
-            if rel.startswith("tests/fixtures/"):
-                return reads | self.new_or_deleted_fixture(rel, old_text, new_text)
+        if top in ("sqlglot", "tests") and is_py and not rel.startswith("tests/fixtures/"):
             name = rel.rsplit("/", 1)[-1]
-            if name in ("conftest.py",) or (rel.startswith("tests/") and name == "__init__.py"):
+            if name == "conftest.py" or (rel.startswith("tests/") and name == "__init__.py"):
                 raise Everything("test infra " + rel)
-            if old_text is None:  # new module
+            if old_text is None:
                 why.append(f"new module {rel}")
-                return self.idx["walkers"]
-            if new_text is None:  # deleted module
-                raise Everything("deleted module " + rel)
-            return self.py_change(rel, old_text, new_text, why) | self.idx["opens"].get(rel, 0)
+                return self.idx["walkers"] | self.idx["importsens"]
+            if new_text is None:
+                why.append(f"deleted module {rel}")
+                return self.import_break(module_name(rel))
+            return self.py_change(rel, old_text, new_text, regions, why) | self.idx["opens"].get(rel, 0)
         if rel.startswith("tests/"):
-            # fixture / data file
             return reads | self.new_or_deleted_fixture(rel, old_text, new_text)
         if top == "sqlglot":
             if rel.endswith((".pyi", "py.typed", ".md", ".txt")):
                 return reads
             raise Everything("non-py under sqlglot " + rel)
-        # outside the package and tests: only what a test reads
         if rel in ("setup.cfg", "pyproject.toml", "setup.py", "pytest.ini", "tox.ini", "conftest.py"):
             raise Everything("config " + rel)
-        if is_py and (old_text is not None and new_text is not None):
+        if is_py and old_text is not None and new_text is not None:
             try:
                 if dump(strip_docstrings(ast.parse(old_text))) == dump(strip_docstrings(ast.parse(new_text))):
                     return self.idx["opens"].get(rel, 0)
@@ -810,7 +1252,6 @@ class Selector:
     def new_or_deleted_fixture(self, rel, old_text, new_text):
         if old_text is not None and new_text is not None:
             return 0
-        # a file appeared or vanished: tests that read its siblings or walk directories
         d = rel.rsplit("/", 1)[0] + "/"
         m = self.idx["walkers"]
         for k, s in self.idx["opens"].items():
@@ -834,7 +1275,7 @@ def main():
         with open(INDEX, "wb") as fh:
             pickle.dump(idx, fh, protocol=pickle.HIGHEST_PROTOCOL)
         os.chmod(INDEX, 0o644)
-        log("index:", len(idx["units"]), "units", len(idx["refs"]), "names")
+        log("index:", len(idx["units"]), "units", len(idx["refs"]), "names", len(idx["core"]), "core modules")
         return
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     durations = [0] * len(tests)
@@ -849,7 +1290,6 @@ def main():
         idx = load_index()
         sel = Selector(idx)
         map_tests = idx["tests"]
-        # tests we have no map for are always run
         known = set(map_tests) - set(idx["missing"])
         always = [t["number"] for t in tests if t["id"] not in known]
         to_number = [number_of.get(t) for t in map_tests]

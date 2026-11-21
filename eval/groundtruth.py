@@ -27,7 +27,7 @@ for i, name in enumerate(patches):
             p = f"{work}/{f['old']}"
             old = open(p, encoding="utf-8").read()
             saved[p] = old
-            new = apply_hunks(old, f["hunks"])
+            new = apply_hunks(old, f["hunks"])[0]
             open(p, "w", encoding="utf-8").write(new)
         t0 = time.time()
         env["FAIL_OUT"] = out + ".tmp"

@@ -11,4 +11,4 @@ with open("/w/work/out_local.jsonl", "w") as out, open("/w/work/sel_local.log", 
 r = resource.getrusage(resource.RUSAGE_CHILDREN)
 print("selector cpu", round(r.ru_utime + r.ru_stime, 3))
 PY
-python tools/eval_sample.py sample sample/answers.json /w/work/out_local.jsonl
+python tools/eval_sample.py "$BR_DATA" "${BR_ANS:-/w/sample/answers.json}" /w/work/out_local.jsonl

@@ -162,8 +162,20 @@ def pytest_configure(config):
             print("preimport failed", info.name, e, file=sys.stderr)
 
 
+def _clear_caches():
+    """Module-level memo caches (e.g. generator._DISPATCH_CACHE) would credit cache-building
+    code only to the first test that hits it; empty them before every test."""
+    for name, mod in list(sys.modules.items()):
+        if not name.startswith("sqlglot") or mod is None:
+            continue
+        for attr, value in list(vars(mod).items()):
+            if "cache" in attr.lower() and isinstance(value, (dict, set)):
+                value.clear()
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_setup(item):
+    _clear_caches()
     _switch("S|" + item.nodeid)
     yield
 
