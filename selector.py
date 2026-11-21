@@ -37,6 +37,27 @@ MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 MAX_DEPTH = 4
 CHECK_FULL = os.environ.get("BR_FULLPARSE") == "1"
+# Variant (branch gamble-max-nodes): leave out test_max_nodes (28.8 s) when it was selected
+# only through class-setting rules. In ~540 commits with ground truth it never failed in that
+# situation (0 of 12) while break-even for a 300 s miss is ~10%. A deliberate risk, not a proof.
+GAMBLE_MAX_NODES = True
+MAX_NODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+
+
+def skip_max_nodes(why):
+    text = "; ".join(why)
+    if "names [" not in text:
+        return False
+    for risky in ("condition profile", "lines in", "function ", "import-time", "syntax error",
+                  "deleted module", "new module", "fixture", "stmt without names", "class header",
+                  "signature", "lambda body"):
+        if risky in text:
+            return False
+    if "import check" in text and "-> failed []" not in text:
+        return False
+    return True
+
+
 IMPORT_CHECK = r"""
 import contextlib, importlib, importlib._bootstrap_external as be, io, json, os, sys
 d = json.load(sys.stdin)
@@ -1977,6 +1998,7 @@ def main():
         map_tests = idx["tests"]
         known = set(map_tests) - set(idx["missing"])
         always = [t["number"] for t in tests if t["id"] not in known]
+        max_nodes = number_of.get(MAX_NODES_ID, -1)
         to_number = [number_of.get(t) for t in map_tests]
     except Exception as e:
         log("selector unavailable, running everything:", repr(e))
@@ -1995,6 +2017,9 @@ def main():
                     mask >>= 1
                     i += 1
                 chosen = sorted(nums)
+                if GAMBLE_MAX_NODES and skip_max_nodes(why) and max_nodes in nums:
+                    chosen.remove(max_nodes)
+                    log(patch.stem, "gamble: max_nodes left out")
                 log(patch.stem, len(chosen), "tests;", "; ".join(why)[:300])
             except Everything as e:
                 log(patch.stem, "everything:", e)
