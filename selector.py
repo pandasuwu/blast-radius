@@ -2438,6 +2438,7 @@ def _same_tree(old, new):
 def tpcds_skippable(sel, budget=0.0):
     """True only if every change can reach test_execute_tpcds only through what the proxy compares,
     and the proxy dump of the patched source is identical to the pristine one."""
+    sel.probe_kind = 0
     base = sel.idx.get("tpcds_base")
     if not base or not sel.idx.get("tpcds_phase"):
         return False
@@ -2445,6 +2446,7 @@ def tpcds_skippable(sel, budget=0.0):
     for f in sel.files:
         rel = f["new"] or f["old"]
         if f["binary"] or not f["old"] or not f["new"] or f["old"] != f["new"]:
+            sel.probe_kind = 4  # PROBE G: binary / new / deleted / renamed file
             return False
         if rel.startswith("tests/fixtures/") and not rel.startswith("tests/fixtures/optimizer/tpc-ds/"):
             continue  # data the test never opens
@@ -2458,12 +2460,15 @@ def tpcds_skippable(sel, budget=0.0):
                         continue
                 except Exception as e:
                     log("tpc-ds fixture compare failed:", repr(e))
+            sel.probe_kind = 1  # PROBE G: tpc-ds.sql edit that changes a query's meta or sql
             return False
         if rel.endswith(".py") and rel in sel.patched and rel.startswith(("sqlglot/", "tests/")):
             old = sel.read_src(rel)
             if old is not None and _same_tree(old, sel.patched[rel]):
                 continue  # comments / formatting only: no code object changes
         if not (rel.startswith("sqlglot/") and rel.endswith(".py")) or rel not in sel.patched:
+            # PROBE G: code edit in a tests/*.py file -> 2, any other path -> 4
+            sel.probe_kind = 2 if rel.startswith("tests/") and rel.endswith(".py") else 4
             return False
         old = sel.read_src(rel)
         if old is None:
@@ -2863,6 +2868,7 @@ def main():
     for patch in patches:
         chosen = everything
         tiers = []
+        markers = 0
         if sel is not None:
             try:
                 text = patch.read_text(encoding="utf-8", errors="replace")
@@ -2880,6 +2886,11 @@ def main():
                         elif tpcds_skippable(sel, min(TPCDS_EXEC_CAP_S, saving / 1000 - TPCDS_MARGIN_S)):
                             chosen = [n for n in chosen if n != tp]
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
+                        elif getattr(sel, "probe_kind", 0):
+                            # PROBE G (measurement only): refused for a file kind -> drop anyway, mark kind
+                            markers = sel.probe_kind
+                            chosen = [n for n in chosen if n != tp]
+                            why.append(f"PROBE G: file-kind refusal {markers}; dropped, {markers} markers")
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
                 if VERIFY_ON and chosen and time.monotonic() - started < VERIFY_BUDGET_S \
@@ -2914,6 +2925,14 @@ def main():
         except Exception as e:
             log(patch.stem, "free riders failed:", repr(e))
             workers = pack(chosen, durations)
+        if markers:
+            used = {n for w in workers for n in w}
+            spare = sorted((n for n in everything if n not in used), key=lambda n: durations[n])
+            top = max((sum(durations[n] for n in w) for w in workers if w), default=0)
+            for n in spare[:max(0, min(markers, MAX_WORKERS - len([w for w in workers if w])))]:
+                if durations[n] <= max(top, 5):
+                    workers.append([n])
+            log(patch.stem, "PROBE G markers:", len([w for w in workers if w]), "workers")
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     if zyg is not None:
         zyg.close()
