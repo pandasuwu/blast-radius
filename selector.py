@@ -700,6 +700,18 @@ def build_index():
         xc = json.load(open(APP / "maps" / "tpcds_xcov.json"))["lines"]
         idx["tpcds_xcov"] = {rel: {int(l): int(m, 16) for l, m in d.items()} for rel, d in xc.items()}
         v, ref = tpcds_run({}, timeout=480)
+        # the budget check reads these timings: one noisy build must not push it over the budget,
+        # so keep each query's fastest of 3 runs (the build is not charged)
+        for _ in range(2):
+            if not (v.get("ok") and ref):
+                break
+            v2, r2 = tpcds_run({}, timeout=480)
+            if not (v2.get("ok") and r2) or any(r2[k] != ref[k] for k in ("parts", "res", "lres", "shape")):
+                log("tpcds reference rerun differs or failed: keeping the first run")
+                break
+            for key in ("sec", "dsec"):
+                if ref.get(key) and r2.get(key):
+                    ref[key] = {q: min(t, r2[key].get(q, t)) for q, t in ref[key].items()}
         idx["tpcds_ref"] = ref if v.get("ok") and ref else None
         idx["tpcds_base"] = bool(idx["tpcds_ref"])
     except Exception as e:
