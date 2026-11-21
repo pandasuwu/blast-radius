@@ -173,11 +173,50 @@ def _clear_caches():
                 value.clear()
 
 
+ATTR_READS = {}  # ctx -> {(owner, attr)}: reads of list-valued test-class attributes
+
+
+class TrackingList(list):
+    """List stored on a TestCase class by setUpClass (e.g. fixture rows); logs which test reads it."""
+    __slots__ = ("_key",)
+
+    def _hit(self):
+        ATTR_READS.setdefault(CUR[0], set()).add(self._key)
+
+    def __iter__(self):
+        self._hit()
+        return super().__iter__()
+
+    def __getitem__(self, i):
+        self._hit()
+        return super().__getitem__(i)
+
+    def __len__(self):
+        self._hit()
+        return super().__len__()
+
+    def __reduce_ex__(self, protocol):
+        return (list, (list(self),))
+
+
+def _wrap_class_lists(item):
+    cls = getattr(item, "cls", None)
+    if cls is None:
+        return
+    owner = item.nodeid.rsplit("::", 1)[0]
+    for k, v in list(vars(cls).items()):
+        if type(v) is list and not k.startswith("__"):
+            tl = TrackingList(v)
+            tl._key = (owner, k)
+            setattr(cls, k, tl)
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_setup(item):
     _clear_caches()
     _switch("S|" + item.nodeid)
     yield
+    _wrap_class_lists(item)
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -202,5 +241,6 @@ def pytest_sessionfinish(session):
     mon.set_events(TOOL, 0)
     js = lambda d: {k: sorted(v) for k, v in d.items()}
     with _open(os.path.join(OUT, "runtime.json"), "w") as f:
-        json.dump({"opens": js(OPENS), "code_opens": js(CODE_OPENS),
+        json.dump({"attr_reads": {k: sorted(map(list, v)) for k, v in ATTR_READS.items()},
+                   "opens": js(OPENS), "code_opens": js(CODE_OPENS),
                    "classes": js(CLASSES), "outcomes": OUTCOMES}, f)

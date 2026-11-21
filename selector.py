@@ -36,6 +36,7 @@ INDEX = Path(os.environ.get("BR_INDEX", APP / "index.pkl"))
 MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 MAX_DEPTH = 4
+CHECK_FULL = os.environ.get("BR_FULLPARSE") == "1"  # evaluation: force the full-file parse path
 
 
 def log(*a):
@@ -277,7 +278,14 @@ class RefIndexer:
                 if c:
                     r = self.resolve_name(c[0], class_stack)
                     bases.append(".".join([r] + c[1:]) if r else ".".join(c))
-            self.classinfo[classkey] = (self.rel, first_line(s), s.end_lineno, tuple(bases))
+            meta = None
+            for kw in s.keywords:
+                if kw.arg == "metaclass":
+                    c = chain(kw.value)
+                    if c:
+                        r = self.resolve_name(c[0], class_stack)
+                        meta = ".".join([r] + c[1:]) if r else ".".join(c)
+            self.classinfo[classkey] = (self.rel, first_line(s), s.end_lineno, tuple(bases), meta)
         unit = self._unit(first_line(s), s.end_lineno, kind, owner, names, classkey)
         if isinstance(s, FUNC_TYPES):
             for n in s.decorator_list + [s.args] + ([s.returns] if s.returns else []):
@@ -511,6 +519,56 @@ def build_index():
             mm |= cover(*units[u][:3])
         if mm:
             mod_refmask[mod] = mm
+    outline = {}
+    for rel, (tree, text) in trees.items():
+        src_lines = text.split("\n")
+        mod = module_name(rel)
+        ent = []
+
+        def walk(stmts, parents, ck):
+            for st in stmts:
+                if isinstance(st, FUNC_TYPES) and st.body:
+                    ent.append((st.body[0].lineno, st.end_lineno, first_line(st), st.lineno,
+                                ("c", ck) if ck else ("m", None), tuple(parents)))
+                elif isinstance(st, ast.ClassDef):
+                    line = src_lines[st.lineno - 1]
+                    ind = line[: len(line) - len(line.lstrip())]
+                    q = f"{ck.split(':', 1)[1]}.{st.name}" if ck else st.name
+                    walk(st.body, parents + [ind], f"{mod}:{q}")
+
+        walk(tree.body, [], None)
+        outline[rel] = ent
+    idx["outline"] = outline
+    setup_attr = {}
+    LOADERS = ("load_sql_fixture_pairs", "load_sql_fixtures")
+    for rel, (tree, text) in trees.items():
+        if not rel.startswith("tests/"):
+            continue
+        for cls_node in ast.walk(tree):
+            if not isinstance(cls_node, ast.ClassDef):
+                continue
+            for fn in cls_node.body:
+                if not (isinstance(fn, FUNC_TYPES) and fn.name == "setUpClass"):
+                    continue
+                for st in ast.walk(fn):
+                    if not (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Attribute)
+                            and isinstance(st.targets[0].value, ast.Name) and st.targets[0].value.id == "cls"):
+                        continue
+                    for call in ast.walk(st.value):
+                        if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id in LOADERS
+                                and call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)):
+                            fx = "tests/fixtures/" + call.args[0].value
+                            setup_attr.setdefault(fx, []).append(
+                                (f"{rel}::{cls_node.name}", st.targets[0].attr, call.func.id, call.args[0].value))
+    idx["setup_attr"] = setup_attr
+    owner_tests = {}
+    for i, tid in enumerate(m["tests"]):
+        owner_tests[tid.rsplit("::", 1)[0]] = owner_tests.get(tid.rsplit("::", 1)[0], 0) | (1 << i)
+    idx["owner_tests"] = owner_tests
+    if "opens_c" in m:
+        idx["opens_c"] = {k: sets[v] for k, v in m["opens_c"].items()}
+        idx["opens_s"] = m["opens_s"]
+        idx["attr_reads"] = {o: {a: sets[v] for a, v in d.items()} for o, d in m["attr_reads"].items()}
     idx.update(units=units, refs=refs, classinfo=classinfo, modules=modules, walkers=walkers,
                core=core, rdeps=rdeps, importsens=importsens, mod_refmask=mod_refmask,
                attrnames=attrnames, toplevel=toplevel)
@@ -831,6 +889,40 @@ class Selector:
             self.memo[("sub", dotted, ck)] = res
         return res
 
+    def metaclass_of(self, ck, seen=None):
+        """Dotted name of ck's metaclass (own or inherited through static bases), or None."""
+        info = self.idx["classinfo"].get(ck)
+        if info is None:
+            return None
+        if len(info) > 4 and info[4]:
+            return info[4]
+        seen = seen or set()
+        seen.add(ck)
+        for b in info[3]:
+            last = b.rsplit(".", 1)[-1]
+            for k in self.idx["classinfo"]:
+                if k in seen:
+                    continue
+                q = k.split(":", 1)[1]
+                if q.rsplit(".", 1)[-1] == last and (b.endswith("." + q) or b == q):
+                    r = self.metaclass_of(k, seen)
+                    if r:
+                        return r
+        return None
+
+    def enclosing_class(self, rel, a, b):
+        best = None
+        for k, info in self.idx["classinfo"].items():
+            if info[0] == rel and info[1] <= a and b <= info[2]:
+                if best is None or info[1] >= self.idx["classinfo"][best][1]:
+                    best = k
+        return best
+
+    @staticmethod
+    def same_class(dotted, ck):
+        mod, qual = ck.split(":", 1)
+        return dotted == f"{mod}.{qual}" or dotted.endswith("." + qual)
+
     def class_attr(self, ck, name, depth=0):
         """Tests that can observe a change of attribute `name` of class `ck`."""
         key = ("ca", ck, name)
@@ -843,12 +935,17 @@ class Selector:
         runtime = 0
         m = 0
         unsafe = depth >= MAX_DEPTH
+        needs_outer = unsafe
+        own_meta = self.metaclass_of(ck)
         for u, resolved, kind in self.idx["refs"].get(name, ()):
             urel, a, b, ukind = self.idx["units"][u][:4]
             if ukind == "f":
                 if self.is_import_time(urel, a, b):
                     if resolved is None or self.is_subclass(resolved.rpartition(".")[0], ck) or kind == 0:
                         unsafe = True
+                        reader = self.enclosing_class(urel, a, b)
+                        if reader is None or own_meta is None or not self.same_class(own_meta, reader):
+                            needs_outer = True
                     else:
                         m |= self.cover(urel, a, b)
                 else:
@@ -856,7 +953,7 @@ class Selector:
                 continue
             # import-time reference in a class body / module statement
             if resolved is None:
-                unsafe = True
+                unsafe = needs_outer = True
             elif kind == 0:
                 if resolved == f"{dotted}.{name}":
                     m |= self.unit_tests(u, depth)
@@ -874,9 +971,11 @@ class Selector:
             m |= exp_users & (users | runtime) if exp_users else users
             m |= runtime & users
         elif unsafe:
-            # read at import time (e.g. a metaclass deriving tables onto the outer dialect class)
+            # read at import time. If the reader is ck's own metaclass, what it derives lives on
+            # ck (users cover it); otherwise (e.g. the dialect metaclass deriving tables from a
+            # nested tokenizer class) the outer classes' users can observe it too.
             m |= users
-            outer = qual
+            outer = qual if needs_outer else ""
             while "." in outer:
                 outer = outer.rsplit(".", 1)[0]
                 m |= self.class_users(f"{mod}:{outer}")
@@ -889,6 +988,15 @@ class Selector:
     def py_change(self, rel, old, new, regions, why):
         mod = module_name(rel)
         self.rel, self.mod = rel, mod
+        self.old_text = old
+        if not CHECK_FULL:
+            r = self.snippet_change(rel, old, new, regions)
+            if r is not None:
+                m, noop = r
+                if noop:
+                    why.append(f"{rel}: comments/docstrings/whitespace only")
+                    return self.idx["opens"].get(rel, 0)
+                return m
         try:
             told = ast.parse(old)
         except SyntaxError:
@@ -909,6 +1017,61 @@ class Selector:
             why.append(f"{rel}: comments/docstrings/whitespace only")
             return self.idx["opens"].get(rel, 0)
         return m
+
+    def snippet_change(self, rel, old, new, regions):
+        """Parse only the function(s) that contain every changed region; None = use full parse."""
+        outline = self.idx.get("outline", {}).get(rel)
+        if not outline or not regions:
+            return None
+        groups = {}
+        for reg in regions:
+            oa, ob, na, nb = reg
+            hit = None
+            for e in outline:
+                body_start, end = e[0], e[1]
+                inside = (body_start <= oa and ob <= end) if ob >= oa else (body_start < oa <= end)
+                if inside:
+                    hit = e
+                    break
+            if hit is None:
+                return None
+            groups.setdefault(hit, []).append(reg)
+        old_lines = old.split("\n")
+        new_lines = new.split("\n")
+        m = 0
+        noop = True
+        for e, regs in groups.items():
+            body_start, end, first, defline, ctx, parents = e
+
+            def delta(upto):
+                return sum((nb - na) - (ob - oa) for oa, ob, na, nb in regions if ob < upto)
+
+            d_first = delta(first)
+            n_first, n_def = first + d_first, defline + d_first
+            n_end = end + delta(end + 1)
+            hdr = [f"{ind}class _P:" for ind in parents]
+            pad = first - 1 - len(hdr)
+            if pad < 0 or n_first - 1 - len(hdr) < 0:
+                return None
+            try:
+                to = ast.parse("\n" * pad + "".join(h + "\n" for h in hdr) + "\n".join(old_lines[first - 1:end]) + "\n")
+                tn = ast.parse("\n" * (n_first - 1 - len(hdr)) + "".join(h + "\n" for h in hdr)
+                               + "\n".join(new_lines[n_first - 1:n_end]) + "\n")
+            except SyntaxError:
+                return None
+            fo, fn = to.body[0], tn.body[0]
+            for _ in parents:
+                if not isinstance(fo, ast.ClassDef) or not isinstance(fn, ast.ClassDef) or len(fo.body) != 1 or len(fn.body) != 1:
+                    return None
+                fo, fn = fo.body[0], fn.body[0]
+            if not (isinstance(fo, FUNC_TYPES) and isinstance(fn, FUNC_TYPES) and fo.lineno == defline
+                    and fo.end_lineno == end and fn.lineno == n_def and fn.end_lineno == n_end):
+                return None
+            for oa, ob, na, nb in regs:
+                r, changed = self.region([fo], [fn], oa, ob, na, nb, ctx, None, False)
+                m |= r
+                noop = noop and not changed
+        return m, noop
 
     def region(self, oblock, nblock, oa, ob, na, nb, ctx, parent, docblock):
         O = [s for s in oblock if overlaps(s, oa, ob)]
@@ -966,7 +1129,7 @@ class Selector:
                 spans.append((first_line(parent), parent.end_lineno))
         func, owner_ctx = ctx[1], ctx[2]
         import_time = any(self.is_import_time(rel, a, b) for a, b in spans)
-        if not import_time and len(O) == 1 and len(N) == 1:
+        if len(O) == 1 and len(N) == 1:
             r = self.refine_stmt(O[0], N[0])
             if r is not None:
                 self.why.append(f"condition profile in {func.name}")
@@ -1056,65 +1219,68 @@ class Selector:
 
     def refine_pair(self, a, b, parents):
         """Tests whose recorded evaluations of old node `a` differ under new node `b`;
-        None when the profile cannot decide."""
+        None when the profile cannot decide (not instrumented, or an import-time
+        evaluation would change)."""
         if a is None or b is None:
             return None
         e = self.prof_entry(a)
-        if e is None or e[2]:  # not instrumented, or evaluated at import time
+        if e is None:
             return None
-        kind, op, imp, sigs = e
+        kind, op, imp_sigs, sigs = e
+        affected = None
         if isinstance(a, ast.Compare) and isinstance(b, ast.Compare) and kind == "cmp":
-            if len(a.ops) != 1 or len(b.ops) != 1 or dump(a.left) != dump(b.left) or \
-                    dump(a.comparators[0]) != dump(b.comparators[0]):
-                return self.all_evals(sigs)
-            new = type(b.ops[0]).__name__
             fam = self.CMP_FAMILY.get(op)
-            if not fam or new not in fam:
-                return self.all_evals(sigs)
-            i, j = fam.index(op), fam.index(new)
-            m = 0
-            for sig, mask in sigs:
-                if len(sig) != len(fam) or sig[i] != sig[j] or "E" in (sig[i], sig[j]):
-                    m |= mask
-            return m
-        if isinstance(a, ast.BoolOp) and kind == "bool":
+            same_operands = (len(a.ops) == 1 and len(b.ops) == 1 and dump(a.left) == dump(b.left)
+                             and dump(a.comparators[0]) == dump(b.comparators[0]))
+            new = type(b.ops[0]).__name__ if len(b.ops) == 1 else None
+            if not same_operands or not fam or new not in fam:
+                affected = lambda sig: True  # noqa: E731
+            else:
+                i, j = fam.index(op), fam.index(new)
+                affected = lambda sig: len(sig) != len(fam) or sig[i] != sig[j] or "E" in (sig[i], sig[j])  # noqa: E731
+        elif isinstance(a, ast.BoolOp) and kind == "bool":
             leaves = {dump(v): k for k, v in enumerate(a.values)}
             if len(leaves) != len(a.values):
-                return self.all_evals(sigs)
-            bool_ctx = self.in_bool_ctx(a, parents)
+                affected = lambda sig: True  # noqa: E731
+            else:
+                bool_ctx = self.in_bool_ctx(a, parents)
 
-            def ev(node, vec, used):
-                if isinstance(node, ast.BoolOp):
-                    res = None
-                    for v in node.values:
-                        res = ev(v, vec, used)
-                        t = res[1]
-                        if (isinstance(node.op, ast.And) and not t) or (isinstance(node.op, ast.Or) and t):
-                            return res
-                    return res
-                k = leaves[dump(node)]  # KeyError: an operand the old expression did not have
-                c = vec[k]
-                if c not in "01":
-                    raise KeyError(c)
-                used.append(k)
-                return k, c == "1"
+                def ev(node, vec, used):
+                    if isinstance(node, ast.BoolOp):
+                        res = None
+                        for v in node.values:
+                            res = ev(v, vec, used)
+                            t = res[1]
+                            if (isinstance(node.op, ast.And) and not t) or (isinstance(node.op, ast.Or) and t):
+                                return res
+                        return res
+                    k = leaves[dump(node)]  # KeyError: an operand the old expression did not have
+                    c = vec[k]
+                    if c not in "01":
+                        raise KeyError(c)
+                    used.append(k)
+                    return k, c == "1"
 
-            m = 0
-            for sig, mask in sigs:
-                try:
-                    if "X" in sig or "E" in sig or len(sig) != len(a.values):
-                        raise KeyError(sig)
-                    old_used = [k for k, c in enumerate(sig) if c != "-"]
-                    old_res = old_used[-1]
-                    used = []
-                    k, t = ev(b, sig, used)
-                    same = used == old_used and (t == (sig[old_res] == "1") if bool_ctx else k == old_res)
-                except KeyError:
-                    same = False
-                if not same:
-                    m |= mask
-            return m
-        return None
+                def affected(sig):
+                    try:
+                        if "X" in sig or "E" in sig or len(sig) != len(a.values):
+                            return True
+                        old_used = [k for k, c in enumerate(sig) if c != "-"]
+                        old_res = old_used[-1]
+                        used = []
+                        k, t = ev(b, sig, used)
+                        return not (used == old_used and (t == (sig[old_res] == "1") if bool_ctx else k == old_res))
+                    except KeyError:
+                        return True
+        if affected is None:
+            return None
+        if any(affected(sg) for sg in imp_sigs):
+            return None
+        m = 0
+        for sig, mask in sigs:
+            if affected(sig):
+                m |= mask
+        return m
 
     @staticmethod
     def all_evals(sigs):
@@ -1289,11 +1455,21 @@ class Selector:
                 self.safe_expr(d) for d in b.args.defaults if d is not None)
         if isinstance(a, ast.Constant):
             return True
+        if isinstance(a, ast.Compare) and len(a.ops) == len(b.ops) and dump(a.left) == dump(b.left) and \
+                [dump(x) for x in a.comparators] == [dump(x) for x in b.comparators]:
+            # same operands, different operator: ==/!=/is/<... over values that already compared fine
+            return all(type(x) in (ast.Eq, ast.NotEq, ast.Is, ast.IsNot, ast.In, ast.NotIn) or
+                       type(y) in (ast.Eq, ast.NotEq, ast.Is, ast.IsNot) or
+                       (type(x) in (ast.Lt, ast.LtE, ast.Gt, ast.GtE) and type(y) in (ast.Lt, ast.LtE, ast.Gt, ast.GtE))
+                       for x, y in zip(a.ops, b.ops))
+        if isinstance(a, ast.UnaryOp) and isinstance(a.op, ast.Not) and dump(a.operand) == dump(b):
+            return True
         if isinstance(a, (ast.Dict,)):
             ok = {(dump(k) if k else "**", dump(v)) for k, v in zip(a.keys, a.values)}
+            old_vals = {dump(v) for v in a.values}
             for k, v in zip(b.keys, b.values):
                 pair = (dump(k) if k else "**", dump(v))
-                if pair in ok:
+                if pair in ok or ((k is None or self.safe_expr(k)) and dump(v) in old_vals):
                     continue
                 # changed value of an existing key, or new entry
                 if not ((k is None or self.safe_expr(k)) and self.safe_expr(v)):
@@ -1356,6 +1532,8 @@ class Selector:
                 if [dump(x) for x in o.decorator_list] != [dump(x) for x in n.decorator_list] or not all(
                         self.safe_expr(d) for d in n.args.defaults + n.args.kw_defaults if d is not None):
                     m |= self.import_break(self.mod)
+            if body_import and [dump(x) for x in o.body] == [dump(x) for x in n.body]:
+                body_import = False  # only the signature changed (handled above)
             if body_import:
                 self.why.append(f"import-time function {where}")
                 m |= self.name_change(o.name, ck) | self.import_break(self.mod)
@@ -1435,6 +1613,7 @@ class Selector:
         if not files:
             return 0, ["empty patch"]
         self.new_modules = {module_name(f["new"]) for f in files if f["new"] and f["new"].endswith(".py")}
+        self.changed = {f["old"] or f["new"] for f in files} | {f["new"] or f["old"] for f in files}
         mask = 0
         for f in files:
             mask |= self.file_change(f)
@@ -1480,7 +1659,7 @@ class Selector:
                 return self.import_break(module_name(rel))
             return self.py_change(rel, old_text, new_text, regions, why) | self.idx["opens"].get(rel, 0)
         if rel.startswith("tests/"):
-            return reads | self.new_or_deleted_fixture(rel, old_text, new_text)
+            return self.fixture_tests(rel, old_text, new_text, reads) | self.new_or_deleted_fixture(rel, old_text, new_text)
         if top == "sqlglot":
             if rel.endswith((".pyi", "py.typed", ".md", ".txt")):
                 return reads
@@ -1495,6 +1674,37 @@ class Selector:
                 pass
         why.append(f"other file {rel}")
         return reads
+
+    def fixture_tests(self, rel, old_text, new_text, reads):
+        """Tests that read a data file. Files a setUpClass loads into class attributes are
+        charged to the tests that read those attributes, if the real loader still accepts the
+        new text (otherwise setUpClass fails and the whole class with it)."""
+        if "opens_c" not in self.idx or new_text is None or old_text is None:
+            return reads
+        m = self.idx["opens_c"].get(rel, 0) | self.idx["code_opens"].get(rel, 0)
+        for owner in self.idx["opens_s"].get(rel, ()):
+            ents = [e for e in self.idx["setup_attr"].get(rel, ()) if e[0] == owner]
+            if ents and all(self.loader_ok(loader, path, new_text) for _, _, loader, path in ents):
+                ar = self.idx["attr_reads"].get(owner, {})
+                for _, attr, _, _ in ents:
+                    m |= ar.get(attr, 0)
+                self.why.append(f"fixture via {owner}.{','.join(e[1] for e in ents)}")
+            else:
+                m |= self.idx["owner_tests"].get(owner, 0) or reads
+        return m
+
+    def loader_ok(self, loader, path, new_text):
+        if "tests/helpers.py" in self.changed:
+            return False
+        try:
+            import io
+            ns = {"__name__": "br_helpers", "__file__": str(SRC / "tests" / "helpers.py")}
+            exec(compile((SRC / "tests" / "helpers.py").read_text(encoding="utf-8"), "helpers.py", "exec"), ns)
+            ns["open"] = lambda *a, **k: io.StringIO(new_text)
+            list(ns[loader](path))
+            return True
+        except Exception:
+            return False
 
     def new_or_deleted_fixture(self, rel, old_text, new_text):
         if old_text is not None and new_text is not None:

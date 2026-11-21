@@ -86,6 +86,28 @@ def invert(d, file_ctx_ok):
 
 
 opens = invert(rt["opens"], True)
+# opens split by phase: during a test's own call (C) vs during class setup (S -> owners)
+opens_c, opens_s = defaultdict(int), defaultdict(set)
+for ctx, items in rt["opens"].items():
+    if ctx.startswith("C|") and ctx[2:] in idx:
+        for it in items:
+            opens_c[it] |= 1 << idx[ctx[2:]]
+    elif ctx.startswith("S|"):
+        for it in items:
+            opens_s[it].add(owner(ctx[2:]))
+    elif ctx.startswith("|"):
+        for it in items:
+            opens_c[it] |= by_file.get(ctx[1:], 0)
+opens_c = {k: sid(v) for k, v in opens_c.items() if v}
+opens_s = {k: sorted(v) for k, v in opens_s.items()}
+attr_reads = defaultdict(lambda: defaultdict(int))
+for ctx, pairs in rt.get("attr_reads", {}).items():
+    cm = ctx_mask(ctx)
+    if cm is None:
+        continue
+    for own, attr in pairs:
+        attr_reads[own][attr] |= cm
+attr_reads = {o: {a: sid(m) for a, m in d.items()} for o, d in attr_reads.items()}
 code_opens = invert(rt["code_opens"], True)
 classes = invert(rt["classes"], False)
 testfiles = {f: sid(m) for f, m in by_file.items()}
@@ -100,7 +122,7 @@ print("failed in baseline", len(bad), list(bad)[:10])
 print("distinct sets", len(sets), "files", len(lines), "opens", len(opens), "classes", len(classes))
 
 doc = {"tests": tests, "sets": [format(m, "x") for m in sets], "lines": lines,
-       "importlines": importlines, "opens": opens, "code_opens": code_opens, "classes": classes, "testfiles": testfiles,
+       "importlines": importlines, "opens": opens, "opens_c": opens_c, "opens_s": opens_s, "attr_reads": attr_reads, "code_opens": code_opens, "classes": classes, "testfiles": testfiles,
        "missing": missing}
 with gzip.open(dest, "wt", compresslevel=9) as fh:
     json.dump(doc, fh, separators=(",", ":"))

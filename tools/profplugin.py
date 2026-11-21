@@ -68,16 +68,13 @@ class Probe:
                 ALT[0] += 1
                 try:
                     v = OPS[alt](left, right)
-                    v = bool(v)
                 except Exception:
                     sig.append("E")
                     continue
                 finally:
                     ALT[0] -= 1
-            try:
-                sig.append("1" if v else "0")
-            except Exception:
-                sig.append("E")
+            # only real bools are comparable; e.g. Expression builders return objects
+            sig.append(("1" if v else "0") if type(v) is bool else "E")
         _rec(nid, "".join(sig))
         return result
 

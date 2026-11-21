@@ -2,7 +2,7 @@
 
 usage: python build_prof.py <prof_dir> <tests.json> <dest>
 Per instrumented node (keyed "rel" -> "lineno,col,end_lineno,end_col"):
-  [kind, op, import_time(0/1), [[signature, set_index], ...]]
+  [kind, op, [import-time signatures], [[signature, set_index], ...]]
 plus "untrusted": tests that did not pass in the instrumented run (their profile is not used).
 """
 import gzip, json, sys
@@ -41,14 +41,15 @@ def sid(mask):
 out = defaultdict(dict)
 for nid, (rel, l, c, el, ec, kind, op) in enumerate(d["nodes"]):
     entry = d["prof"].get(str(nid), {})
-    imp = 0
+    imp = []  # signatures seen at import / collection time
     sigs = []
     for sig, ctxs in entry.items():
         m = 0
         for ctx in ctxs:
             cm = ctx_mask(ctx)
             if cm is None:
-                imp = 1
+                if sig not in imp:
+                    imp.append(sig)
             else:
                 m |= cm
         if m:
@@ -56,7 +57,7 @@ for nid, (rel, l, c, el, ec, kind, op) in enumerate(d["nodes"]):
     key = f"{l},{c},{el},{ec}"
     if key in out[rel]:  # same position instrumented twice (module imported twice): merge
         prev = out[rel][key]
-        prev[2] |= imp
+        prev[2].extend(x for x in imp if x not in prev[2])
         prev[3].extend(sigs)
     else:
         out[rel][key] = [kind, op, imp, sigs]
