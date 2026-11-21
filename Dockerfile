@@ -7,7 +7,7 @@ COPY tools/fetch_sqlglot.py /app/fetch_sqlglot.py
 RUN python /app/fetch_sqlglot.py /app/src && chmod -R a+rX /app/src
 # pristine bytecode (build time, not charged): patched files are still compiled from source
 # test-module dependencies at the labelling versions (requirements.lock), for runtime verification
-RUN pip install --no-cache-dir pytz==2026.6 python-dateutil==4.0.0 tzdata==2026.6
+RUN pip install --no-cache-dir pytz==2026.6 python-dateutil==4.0.0 tzdata==2026.6 duckdb==2.0.0
 RUN python -m compileall -q /app/src/sqlglot /app/src/tests
 COPY maps /app/maps
 COPY selector.py /app/selector.py

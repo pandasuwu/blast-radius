@@ -2210,6 +2210,33 @@ def run(e, names, tables):
     return (result_digest(r), loose_digest(r)), time.process_time() - t
 
 
+_DUCK = []
+
+
+def duck_digest(sql_text):
+    """The test's reference result: duckdb (unpatched) on transpile(sql, write="duckdb") over
+    views made exactly as TestExecutor.setUpClass makes them. (strict, loose) digests, CPU."""
+    import types
+    if not _DUCK:
+        import duckdb
+        c = duckdb.connect()
+        c.execute("SET threads TO 1")  # deterministic order and CPU
+        for table, columns in TPCDS_SCHEMA.items():
+            file_name = f"{FIXTURES_DIR}/optimizer/tpc-ds/{table}.csv.gz"
+            c.execute(
+                f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+            )
+        _DUCK.append(c)
+    t1 = time.process_time()
+    cur = _DUCK[0].execute(sql_text)
+    res = types.SimpleNamespace(columns=[d[0] for d in cur.description], rows=cur.fetchall())
+    return (result_digest(res), loose_digest(res)), time.process_time() - t1
+
+
 def verdict(**k):
     k["cpu"] = round(time.process_time() - t0, 2)
     print("VERDICT " + json.dumps(k), file=sys.stderr)
@@ -2231,7 +2258,8 @@ for i, (meta, sql, _) in enumerate(sqls):
         parts.append(None)  # the child returns None for it: parsing and pickling is all that matters
         continue
     names = sorted({t.name for t in find_tables(e)})
-    duck = hashlib.sha256(transpile(sql, write="duckdb")[0].encode()).hexdigest()[:20]
+    duck_sql = transpile(sql, write="duckdb")[0]
+    duck = hashlib.sha256(duck_sql.encode()).hexdigest()[:20]
     blob = pickle.dumps(e)  # execute() gets the unpickled tree, before optimize() touches it
     will_run = REF is not None and EXEC_ALL and (EXEC_SET is None or i in EXEC_SET)
     # execute() optimizes again and its rows are compared: no need to compare the tree first
@@ -2239,11 +2267,21 @@ for i, (meta, sql, _) in enumerate(sqls):
                                                 dialect=None))
     parts.append([names, duck, opt])
     if REF is None:
-        todo.append((i, blob, names))
+        todo.append((i, blob, names, duck_sql))
         continue
     ref = REF["parts"][i]
-    if ref is None or duck != ref[1]:
-        verdict(ok=False, why=f"query {i}: duckdb reference SQL changed")
+    if ref is None:
+        verdict(ok=False, why=f"query {i}: not an executed query before")
+    if duck != ref[1]:
+        # the reference SQL changed: the test passes as before if duckdb still returns the same
+        if not REF.get("dres"):
+            verdict(ok=False, why=f"query {i}: duckdb reference SQL changed")
+        est += REF["dsec"][str(i)] + (0.5 if not _DUCK else 0.0)
+        if est > BUDGET:
+            verdict(ok=False, why=f"query {i}: duckdb reference SQL changed (no budget to run it)")
+        (ds, dl), _ = duck_digest(duck_sql)
+        if ds != REF["dres"][str(i)][0] and dl != REF["dres"][str(i)][1]:
+            verdict(ok=False, why=f"query {i}: duckdb reference result changed")
     if will_run or names != ref[0] or opt != ref[2]:
         # changed tree or tables, or changed execution code: execute it now (as the test's pool
         # child does) and compare rows
@@ -2264,12 +2302,19 @@ for i, (meta, sql, _) in enumerate(sqls):
             verdict(ok=False, why=f"query {i}: different rows")
         todo.append((i, blob, names))
 if REF is None:
-    for n in sorted({n for _, _, ns in todo for n in ns}):
+    for n in sorted({n for _, _, ns, _ in todo for n in ns}):
         tables[n] = load_table(n)
-    res, lres, sec = {}, {}, {}
-    for i, blob, names in todo:
+    res, lres, sec, dres, dsec = {}, {}, {}, {}, {}
+    for i, blob, names, duck_sql in todo:
         (res[str(i)], lres[str(i)]), sec[str(i)] = run(pickle.loads(blob), names, tables)
-    print("REF " + json.dumps({"parts": parts, "res": res, "lres": lres,
+    try:
+        for i, blob, names, duck_sql in todo:
+            dres[str(i)], dsec[str(i)] = duck_digest(duck_sql)
+            dsec[str(i)] = round(dsec[str(i)], 3)
+    except Exception as e:  # no duckdb: a changed reference SQL keeps the test, as before
+        print("no duckdb reference:", repr(e), file=sys.stderr)
+        dres, dsec = None, None
+    print("REF " + json.dumps({"parts": parts, "res": res, "lres": lres, "dres": dres, "dsec": dsec,
                                "sec": {k: round(v, 3) for k, v in sec.items()}}), file=sys.stderr)
     verdict(ok=True, ref=True)
 verdict(ok=True, executed=[i for i, _, _ in todo])
