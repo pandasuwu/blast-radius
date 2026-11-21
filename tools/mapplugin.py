@@ -199,6 +199,52 @@ class TrackingList(list):
         return (list, (list(self),))
 
 
+FIELD_READS = {}  # ctx -> {(owner, attr, field)}: uses of str fields of tuple elements
+
+
+def _field_hit(key):
+    FIELD_READS.setdefault(CUR[0], set()).add(key)
+
+
+class TrackedStr(str):
+    """A fixture string kept by setUpClass; any use of it is logged for the current test."""
+
+    def __getattribute__(self, name):
+        if name not in ("_k", "__dict__", "__class__"):
+            _field_hit(str.__getattribute__(self, "_k"))
+        return str.__getattribute__(self, name)
+
+
+def _logged(op):
+    def f(self, *a):
+        _field_hit(str.__getattribute__(self, "_k"))
+        return getattr(str, op)(self, *a)
+    f.__name__ = op
+    return f
+
+
+for _op in ("__len__", "__getitem__", "__iter__", "__hash__", "__eq__", "__ne__", "__lt__", "__le__",
+            "__gt__", "__ge__", "__contains__", "__add__", "__radd__", "__mod__", "__rmod__", "__mul__",
+            "__rmul__", "__format__", "__str__", "__repr__"):
+    if hasattr(str, _op):
+        setattr(TrackedStr, _op, _logged(_op))
+
+
+def _radd(self, other):
+    _field_hit(str.__getattribute__(self, "_k"))
+    return other + str(self)
+
+
+TrackedStr.__radd__ = _radd
+TrackedStr.__reduce_ex__ = lambda self, p: (str, (str.__str__(self),))
+
+
+def _track_str(s, key):
+    t = TrackedStr(s)
+    t._k = key
+    return t
+
+
 def _wrap_class_lists(item):
     cls = getattr(item, "cls", None)
     if cls is None:
@@ -206,7 +252,12 @@ def _wrap_class_lists(item):
     owner = item.nodeid.rsplit("::", 1)[0]
     for k, v in list(vars(cls).items()):
         if type(v) is list and not k.startswith("__"):
-            tl = TrackingList(v)
+            rows = []
+            for el in v:
+                if type(el) is tuple:
+                    el = tuple(_track_str(x, (owner, k, j)) if type(x) is str else x for j, x in enumerate(el))
+                rows.append(el)
+            tl = TrackingList(rows)
             tl._key = (owner, k)
             setattr(cls, k, tl)
 
@@ -242,5 +293,6 @@ def pytest_sessionfinish(session):
     js = lambda d: {k: sorted(v) for k, v in d.items()}
     with _open(os.path.join(OUT, "runtime.json"), "w") as f:
         json.dump({"attr_reads": {k: sorted(map(list, v)) for k, v in ATTR_READS.items()},
+                   "field_reads": {k: sorted(map(list, v)) for k, v in FIELD_READS.items()},
                    "opens": js(OPENS), "code_opens": js(CODE_OPENS),
                    "classes": js(CLASSES), "outcomes": OUTCOMES}, f)

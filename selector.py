@@ -566,6 +566,8 @@ def build_index():
         owner_tests[tid.rsplit("::", 1)[0]] = owner_tests.get(tid.rsplit("::", 1)[0], 0) | (1 << i)
     idx["owner_tests"] = owner_tests
     if "opens_c" in m:
+        idx["field_reads"] = {o: {a: {f: sets[v] for f, v in fd.items()} for a, fd in d.items()}
+                              for o, d in m.get("field_reads", {}).items()}
         idx["opens_c"] = {k: sets[v] for k, v in m["opens_c"].items()}
         idx["opens_s"] = m["opens_s"]
         idx["attr_reads"] = {o: {a: sets[v] for a, v in d.items()} for o, d in m["attr_reads"].items()}
@@ -1686,25 +1688,62 @@ class Selector:
             ents = [e for e in self.idx["setup_attr"].get(rel, ()) if e[0] == owner]
             if ents and all(self.loader_ok(loader, path, new_text) for _, _, loader, path in ents):
                 ar = self.idx["attr_reads"].get(owner, {})
-                for _, attr, _, _ in ents:
-                    m |= ar.get(attr, 0)
+                fr = self.idx.get("field_reads", {}).get(owner, {})
+                for _, attr, loader, path in ents:
+                    fields = self.changed_fields(loader, path, old_text, new_text)
+                    if fields is None or attr not in fr:
+                        m |= ar.get(attr, 0)
+                    else:
+                        # only tests that used a changed field (e.g. the SQL vs the expected output)
+                        for f in fields:
+                            m |= fr[attr].get(str(f), 0)
                 self.why.append(f"fixture via {owner}.{','.join(e[1] for e in ents)}")
             else:
                 m |= self.idx["owner_tests"].get(owner, 0) or reads
         return m
 
+    def run_loader(self, loader, path, text):
+        """The pristine tests/helpers.py loader applied to `text`; raises what it raises."""
+        import io
+        ns = self.memo.get("helpers_ns")
+        if ns is None:
+            ns = {"__name__": "br_helpers", "__file__": str(SRC / "tests" / "helpers.py")}
+            exec(compile((SRC / "tests" / "helpers.py").read_text(encoding="utf-8"), "helpers.py", "exec"), ns)
+            self.memo["helpers_ns"] = ns
+        ns["open"] = lambda *a, **k: io.StringIO(text)
+        return list(ns[loader](path))
+
     def loader_ok(self, loader, path, new_text):
         if "tests/helpers.py" in self.changed:
             return False
         try:
-            import io
-            ns = {"__name__": "br_helpers", "__file__": str(SRC / "tests" / "helpers.py")}
-            exec(compile((SRC / "tests" / "helpers.py").read_text(encoding="utf-8"), "helpers.py", "exec"), ns)
-            ns["open"] = lambda *a, **k: io.StringIO(new_text)
-            list(ns[loader](path))
+            self.run_loader(loader, path, new_text)
             return True
         except Exception:
             return False
+
+    def changed_fields(self, loader, path, old_text, new_text):
+        """Indices of tuple fields that differ between the loaded old and new rows; None when
+        rows shift, are not tuples, or a non-string field (e.g. metadata) changed."""
+        try:
+            old_rows = self.run_loader(loader, path, old_text)
+            new_rows = self.run_loader(loader, path, new_text)
+        except Exception:
+            return None
+        if len(old_rows) != len(new_rows):
+            return None
+        fields = set()
+        for o, n in zip(old_rows, new_rows):
+            if type(o) is not tuple or type(n) is not tuple or len(o) != len(n):
+                if o != n:
+                    return None
+                continue
+            for j, (x, y) in enumerate(zip(o, n)):
+                if x != y:
+                    if type(x) is not str or type(y) is not str:
+                        return None
+                    fields.add(j)
+        return fields
 
     def new_or_deleted_fixture(self, rel, old_text, new_text):
         if old_text is not None and new_text is not None:

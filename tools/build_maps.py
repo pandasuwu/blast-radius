@@ -108,6 +108,14 @@ for ctx, pairs in rt.get("attr_reads", {}).items():
     for own, attr in pairs:
         attr_reads[own][attr] |= cm
 attr_reads = {o: {a: sid(m) for a, m in d.items()} for o, d in attr_reads.items()}
+field_reads = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+for ctx, triples in rt.get("field_reads", {}).items():
+    cm = ctx_mask(ctx)
+    if cm is None:
+        continue
+    for own, attr, field in triples:
+        field_reads[own][attr][field] |= cm
+field_reads = {o: {a: {str(f): sid(m) for f, m in fd.items()} for a, fd in d.items()} for o, d in field_reads.items()}
 code_opens = invert(rt["code_opens"], True)
 classes = invert(rt["classes"], False)
 testfiles = {f: sid(m) for f, m in by_file.items()}
@@ -122,7 +130,7 @@ print("failed in baseline", len(bad), list(bad)[:10])
 print("distinct sets", len(sets), "files", len(lines), "opens", len(opens), "classes", len(classes))
 
 doc = {"tests": tests, "sets": [format(m, "x") for m in sets], "lines": lines,
-       "importlines": importlines, "opens": opens, "opens_c": opens_c, "opens_s": opens_s, "attr_reads": attr_reads, "code_opens": code_opens, "classes": classes, "testfiles": testfiles,
+       "importlines": importlines, "opens": opens, "opens_c": opens_c, "opens_s": opens_s, "attr_reads": attr_reads, "field_reads": field_reads, "code_opens": code_opens, "classes": classes, "testfiles": testfiles,
        "missing": missing}
 with gzip.open(dest, "wt", compresslevel=9) as fh:
     json.dump(doc, fh, separators=(",", ":"))
