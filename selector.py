@@ -702,6 +702,27 @@ def build_index():
         log("tpcds proxy disabled:", repr(e))
         idx["tpcds_base"] = None
     log("tpcds proxy baseline:", idx["tpcds_base"])
+    idx["tpcds_exec"] = None
+    try:
+        em = json.load(open(APP / "maps" / "tpcds_exec.json"))
+        qs = {}
+        srcs = {}
+        for qi, q in em["queries"].items():
+            lines = {rel: set(v) for rel, v in q["lines"].items()}
+            qnames = set()
+            for rel, ls in lines.items():
+                if rel not in srcs:
+                    srcs[rel] = (SRC / rel).read_text(encoding="utf-8").split("\n")
+                for ln in ls:
+                    qnames.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", srcs[rel][ln - 1]))
+            qs[int(qi)] = {"lines": lines, "classes": set(q["classes"]), "names": qnames}
+        rec = tpcds_replay_run({}, "record")
+        if not rec or "queries" not in rec:
+            raise RuntimeError("replay record failed")
+        idx["tpcds_exec"] = {"q": qs, "rec": rec}
+        log("tpcds replay record: cpu", rec.get("cpu"), "queries", len(qs))
+    except Exception as e:
+        log("tpcds replay disabled:", repr(e))
     return idx
 
 
@@ -2342,6 +2363,111 @@ def tpcds_skippable(sel):
     return h is not None and h == base
 
 
+# ----------------------------------------------------------------------------- TPC-DS replay (v5.5)
+# tools/tpcds_replay.py replays test_execute_tpcds without duckdb: every step the test's outcome
+# depends on is compared with its pristine value, and a query is executed only when its optimized
+# tree differs or its execution path (maps/tpcds_exec.json) reaches the change. Identical values
+# everywhere -> the patched run returns the frames the pristine run returns -> the test passes.
+REPLAY = APP / "tpcds_replay.py"
+REPLAY_CAP_S = 12.0  # never spend more charged CPU than this on one replay
+REPLAY_SHARE = 0.5  # ... nor more than this share of the simulated time it can save
+ALL_QUERIES = "all"
+
+
+def tpcds_replay_run(overlay, mode, expect=None, need="all", cap=1e9):
+    import subprocess
+    try:
+        p = subprocess.run([sys.executable, "-I", "-B", str(REPLAY)], cwd=str(SRC),
+                           input=json.dumps({"src": str(SRC), "overlay": overlay, "mode": mode, "expect": expect,
+                                             "need": need, "cap": cap}),
+                           capture_output=True, text=True, timeout=240,
+                           env={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "PATH": os.environ.get("PATH", "")})
+        out = [l for l in p.stdout.splitlines() if l.startswith("{")]
+        return json.loads(out[-1]) if out else None
+    except Exception as e:
+        log("tpcds replay failed:", repr(e))
+        return None
+
+
+def tpcds_region_need(sel, rel, tree, oa, ob, why):
+    """Queries whose execution (outside the compared optimize call) can see this changed region."""
+    X = sel.idx["tpcds_exec"]["q"]
+    lo, hi = (oa, ob) if ob >= oa else (max(ob, 1), oa)
+    chain = _stmt_chain(tree, lo, hi)
+    if not chain:
+        lines = set(range(lo, hi + 1))
+    else:
+        s = chain[-1]
+        body = [b for f in BLOCK_FIELDS for b in (getattr(s, f, None) or [])]
+        top = first_line(body[0]) - 1 if body and hi < first_line(body[0]) else s.end_lineno
+        lines = set(range(first_line(s), top + 1)) | set(range(lo, hi + 1))
+    need = {q for q, d in X.items() if lines & d["lines"].get(rel, set())}
+    il = sel.idx["importlines"].get(rel, ())
+    if not any(x in il for x in lines):
+        return need  # call-time code: the queries that run it
+    if not chain:
+        return ALL_QUERIES
+    s = chain[-1]
+    if isinstance(s, DEF_TYPES) and any(first_line(d) <= hi and lo <= d.end_lineno for d in s.decorator_list):
+        why.append(f"replay: {rel}:{lo} decorator")
+        return ALL_QUERIES
+    if isinstance(s, FUNC_TYPES) and s.body and hi < first_line(s.body[0]):
+        span = set(range(first_line(s), s.end_lineno + 1))
+        return need | {q for q, d in X.items() if span & d["lines"].get(rel, set())}
+    classes = [c for c in chain if isinstance(c, ast.ClassDef)]
+    if classes:
+        c = classes[-1]
+        key = module_name(rel) + ":" + ".".join(x.name for x in classes)
+        return need | {q for q, d in X.items() if key in d["classes"] or c.name in d["names"]}
+    names = _bound_names(s)
+    if names is None:
+        why.append(f"replay: {rel}:{lo} module-level statement")
+        return ALL_QUERIES
+    return need | {q for q, d in X.items() if rel in d["lines"] or names & d["names"]}
+
+
+def tpcds_replay_ok(sel, saving_ms):
+    """True only if the replay of the patched source matches the pristine one at every step."""
+    X = sel.idx.get("tpcds_exec")
+    if not X:
+        return False
+    why = sel.why
+    allq = set(X["q"])
+    need = set()
+    for f in sel.files:
+        rel = f["new"] or f["old"]
+        if f["binary"] or not f["old"] or not f["new"] or f["old"] != f["new"]:
+            return False
+        if rel.startswith("tests/fixtures/") and not rel.startswith("tests/fixtures/optimizer/tpc-ds/"):
+            continue  # data the test never opens
+        if not (rel.startswith("sqlglot/") and rel.endswith(".py")) or rel not in sel.patched:
+            return False
+        old = sel.read_src(rel)
+        if old is None:
+            return False
+        tree = ast.parse(old)
+        _, regions = apply_hunks(old, f["hunks"])
+        for oa, ob, _na, _nb in regions:
+            r = tpcds_region_need(sel, rel, tree, oa, ob, why)
+            need = set(allq) if r == ALL_QUERIES else (need | r)
+            if need == allq:
+                break
+    rec = X["rec"]
+    qcpu = {int(k): v.get("cpu", 0) for k, v in rec["queries"].items()}
+    base = rec.get("cpu", 20) - sum(qcpu.values())
+    est = base + sum(qcpu.get(q, 0) for q in need)
+    cap = min(REPLAY_CAP_S, REPLAY_SHARE * saving_ms / 1000)
+    if est > cap:
+        why.append(f"replay: {len(need)} queries, est {est:.1f} s > cap {cap:.1f} s")
+        return False
+    res = tpcds_replay_run({str(SRC / rel): text for rel, text in sel.patched.items()}, "check",
+                           expect=rec, need=sorted(need), cap=cap)
+    ok = bool(res and res.get("ok") is True)
+    why.append(f"replay {len(need)} queries: {'identical' if ok else (res or {}).get('why')} "
+               f"({(res or {}).get('cpu')} s)")
+    return ok
+
+
 def load_index():
     try:
         with open(INDEX, "rb") as fh:
@@ -2406,9 +2532,9 @@ def main():
                             why.append(f"tpcds proxy not worth it (saves {saving} ms)")
                         elif time.monotonic() - started > TPCDS_BUDGET_S:
                             why.append("tpcds proxy: time budget spent")
-                        elif tpcds_skippable(sel):
+                        elif tpcds_replay_ok(sel, saving):
                             chosen = [n for n in chosen if n != tp]
-                            why.append("tpcds proxy: identical, test_execute_tpcds left out")
+                            why.append("tpcds replay: identical, test_execute_tpcds left out")
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
                 try:

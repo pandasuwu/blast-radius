@@ -8,6 +8,7 @@ RUN python /app/fetch_sqlglot.py /app/src && chmod -R a+rX /app/src
 # pristine bytecode (build time, not charged): patched files are still compiled from source
 RUN python -m compileall -q /app/src/sqlglot /app/src/tests
 COPY maps /app/maps
+COPY tools/tpcds_replay.py /app/tpcds_replay.py
 COPY selector.py /app/selector.py
 # maps + reference index -> /app/index.pkl (build time, not charged)
 RUN python /app/selector.py --prep && chmod -R a+rX /app
