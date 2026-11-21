@@ -2207,7 +2207,7 @@ def run(e, names, tables):
     t = time.process_time()
     tabs = {n: tables[n] for n in names}  # mp_execute picks them out of the initargs dict
     r = pickle.loads(pickle.dumps(execute(e, schema=TPCDS_SCHEMA, tables=tabs)))
-    return (result_digest(r), loose_digest(r)), time.process_time() - t
+    return (result_digest(r), loose_digest(r)), time.process_time() - t, r
 
 
 _DUCK = []
@@ -2217,6 +2217,14 @@ def duck_digest(sql_text):
     """The test's reference result: duckdb (unpatched) on transpile(sql, write="duckdb") over
     views made exactly as TestExecutor.setUpClass makes them. (strict, loose) digests, CPU."""
     import types
+    _duck_conn()
+    t1 = time.process_time()
+    cur = _DUCK[0].execute(sql_text)
+    res = types.SimpleNamespace(columns=[d[0] for d in cur.description], rows=cur.fetchall())
+    return (result_digest(res), loose_digest(res)), time.process_time() - t1
+
+
+def _duck_conn():
     if not _DUCK:
         import duckdb
         c = duckdb.connect()
@@ -2231,10 +2239,21 @@ def duck_digest(sql_text):
                 """
             )
         _DUCK.append(c)
-    t1 = time.process_time()
-    cur = _DUCK[0].execute(sql_text)
-    res = types.SimpleNamespace(columns=[d[0] for d in cur.description], rows=cur.fetchall())
-    return (result_digest(res), loose_digest(res)), time.process_time() - t1
+    return _DUCK[0]
+
+
+def test_assert(duck_sql, table):
+    """The test's own check for one query (TestExecutor.cached_execute + subtestHelper)."""
+    import numpy as np
+    import pandas as pd
+    from pandas.testing import assert_frame_equal
+    a = _duck_conn().execute(duck_sql).fetchdf()
+    b = pd.DataFrame(((np.nan if c is None else c for c in r) for r in table.rows), columns=table.columns)
+    try:
+        assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
+        return True
+    except AssertionError:
+        return False
 
 
 def verdict(**k):
@@ -2280,9 +2299,10 @@ for i, (meta, sql, _) in enumerate(sqls):
         if est > BUDGET:
             verdict(ok=False, why=f"query {i}: duckdb reference SQL changed (no budget to run it)")
         (ds, dl), _ = duck_digest(duck_sql)
-        if ds != REF["dres"][str(i)][0] and dl != REF["dres"][str(i)][1]:
-            verdict(ok=False, why=f"query {i}: duckdb reference result changed")
-    if will_run or names != ref[0] or opt != ref[2]:
+        duck_changed = ds != REF["dres"][str(i)][0] and dl != REF["dres"][str(i)][1]
+    else:
+        duck_changed = False
+    if will_run or duck_changed or names != ref[0] or opt != ref[2]:
         # changed tree or tables, or changed execution code: execute it now (as the test's pool
         # child does) and compare rows
         est += REF["sec"][str(i)]
@@ -2295,18 +2315,25 @@ for i, (meta, sql, _) in enumerate(sqls):
                 est += time.process_time() - t1
         if est > BUDGET:
             verdict(ok=False, why=f"query {i}: loading its tables spent the budget")
-        (strict, loose), took = run(pickle.loads(blob), names, tables)
+        (strict, loose), took, table = run(pickle.loads(blob), names, tables)
         if took > 3 * REF["sec"][str(i)] + 0.5:
             verdict(ok=False, why=f"query {i}: execution much slower than pristine (slow patch?)")
-        if strict != REF["res"][str(i)] and loose != REF["lres"][str(i)]:
-            verdict(ok=False, why=f"query {i}: different rows")
+        if duck_changed or (strict != REF["res"][str(i)] and loose != REF["lres"][str(i)]):
+            # rows or reference differ from pristine: decide exactly as the test does
+            if not REF.get("dres"):
+                verdict(ok=False, why=f"query {i}: different rows")
+            est += (0.0 if "pandas" in sys.modules else 1.2) + REF["dsec"][str(i)] + (0.5 if not _DUCK else 0.0)
+            if est > BUDGET:
+                verdict(ok=False, why=f"query {i}: different rows (no budget for the exact check)")
+            if not test_assert(duck_sql, table):
+                verdict(ok=False, why=f"query {i}: different rows")
         todo.append((i, blob, names))
 if REF is None:
     for n in sorted({n for _, _, ns, _ in todo for n in ns}):
         tables[n] = load_table(n)
     res, lres, sec, dres, dsec = {}, {}, {}, {}, {}
     for i, blob, names, duck_sql in todo:
-        (res[str(i)], lres[str(i)]), sec[str(i)] = run(pickle.loads(blob), names, tables)
+        (res[str(i)], lres[str(i)]), sec[str(i)], _ = run(pickle.loads(blob), names, tables)
     try:
         for i, blob, names, duck_sql in todo:
             dres[str(i)], dsec[str(i)] = duck_digest(duck_sql)
