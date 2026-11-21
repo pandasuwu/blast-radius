@@ -26,6 +26,7 @@ import os
 import pickle
 import re
 import sys
+import time
 from pathlib import Path
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
@@ -44,6 +45,8 @@ ov = {os.path.realpath(k): v.encode("utf-8") for k, v in d["overlay"].items()}
 _orig = be.FileLoader.get_data
 def _get_data(self, path):
     rp = os.path.realpath(path)
+    if rp.endswith(".pyc"):
+        raise OSError("bytecode disabled: compile from (patched) source")
     return ov[rp] if rp in ov else _orig(self, path)
 be.FileLoader.get_data = _get_data
 sys.path.insert(0, d["src"])
@@ -678,7 +681,20 @@ def build_index():
     except Exception as e:
         log("shared pool scan failed:", repr(e))
         idx["pool_groups"] = []
-    idx["tpcds_base"] = tpcds_hash({})
+    idx["tpcds_phase"] = None
+    try:
+        ph = json.load(open(APP / "maps" / "tpcds_phase.json"))
+        ulines = {rel: set(v) for rel, v in ph["lines"].items()}
+        names = set()
+        for rel, ls in ulines.items():
+            src_lines = (SRC / rel).read_text(encoding="utf-8").split("\n")
+            for ln in ls:
+                names.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", src_lines[ln - 1]))
+        idx["tpcds_phase"] = {"lines": ulines, "classes": set(ph["classes"]), "names": names}
+        idx["tpcds_base"], idx["tpcds_steps"] = tpcds_hash({}, with_steps=True)
+    except Exception as e:
+        log("tpcds proxy disabled:", repr(e))
+        idx["tpcds_base"] = None
     log("tpcds proxy baseline:", idx["tpcds_base"])
     return idx
 
@@ -1862,6 +1878,7 @@ class Selector:
     def select(self, patch_text):
         self.why = why = []
         files = parse_patch(patch_text)
+        self.files = files
         if not files:
             return 0, ["empty patch"]
         self.new_modules = {module_name(f["new"]) for f in files if f["new"] and f["new"].endswith(".py")}
@@ -2131,6 +2148,8 @@ def dump(x, out, seen=None):
 
 
 h = hashlib.sha256()
+steps = []  # running hash after each query; EXPECT (pristine steps) allows stopping at the first difference
+EXPECT = globals().get("EXPECT")
 sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
 schema = ensure_schema(TPCDS_SCHEMA)
 n_exec = 0
@@ -2146,10 +2165,15 @@ for meta, sql, _ in sqls:
         dump(optimize(e, ensure_schema(TPCDS_SCHEMA), leave_tables_isolated=True, dialect=None), out, seen)
     blob = "\x00".join(out).encode("utf-8", "surrogatepass")
     h.update(blob)
+    steps.append(h.copy().hexdigest()[:16])
+    if EXPECT is not None and (len(EXPECT) < len(steps) or EXPECT[len(steps) - 1] != steps[-1]):
+        print("0" * 64, len(sqls), n_exec, round(time.process_time() - t0, 2), file=sys.stderr)
+        sys.exit(0)
     if len(sys.argv) > 1:
         print(hashlib.sha256(blob).hexdigest()[:12], file=sys.stderr)
         if sys.argv[1] != "1":
             open(f"{sys.argv[1]}.{n_exec}", "wb").write(blob)
+print("STEPS " + " ".join(steps), file=sys.stderr)
 print(h.hexdigest(), len(sqls), n_exec, round(time.process_time() - t0, 2), file=sys.stderr)
 '''
 TPCDS_RUN = r"""
@@ -2159,45 +2183,150 @@ ov = {os.path.realpath(k): v.encode("utf-8") for k, v in d["overlay"].items()}
 _orig = be.FileLoader.get_data
 def _get_data(self, path):
     rp = os.path.realpath(path)
+    if rp.endswith(".pyc"):
+        raise OSError("bytecode disabled: compile from (patched) source")
     return ov[rp] if rp in ov else _orig(self, path)
 be.FileLoader.get_data = _get_data
 sys.path.insert(0, d["src"])
 sys.argv = ["proxy"]
-exec(compile(d["proxy"], "tpcds_proxy", "exec"), {"__name__": "__main__"})
+exec(compile(d["proxy"], "tpcds_proxy", "exec"), {"__name__": "__main__", "EXPECT": d.get("expect")})
 """
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_MIN_SAVING_MS = 6000  # the proxy costs about 3-4 s of charged CPU
+# wall clock; the run limit is 180 s (270 s in the final). Override only for big offline eval batches.
+TPCDS_BUDGET_S = float(os.environ.get("BR_TPCDS_BUDGET", "120"))
 
 
-def tpcds_hash(overlay):
-    """Proxy hash of the source with `overlay` swapped in; None if it cannot be computed."""
+def plan_cost(workers, durations):
+    ws = [w for w in workers if w]
+    return max(sum(durations[n] for n in w) for w in ws) + WORKER_COST_MS * len(ws) if ws else 0
+
+
+def tpcds_hash(overlay, expect=None, with_steps=False):
+    """Proxy hash of the source with `overlay` swapped in; None if it cannot be computed. With
+    `expect` (the pristine steps) the proxy stops at the first query that differs."""
     import subprocess
     try:
         p = subprocess.run([sys.executable, "-I", "-B", "-c", TPCDS_RUN], cwd=str(SRC),
-                           input=json.dumps({"src": str(SRC), "overlay": overlay, "proxy": TPCDS_PROXY}),
+                           input=json.dumps({"src": str(SRC), "overlay": overlay, "proxy": TPCDS_PROXY,
+                                             "expect": expect}),
                            capture_output=True, text=True, timeout=240,
                            env={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "PATH": os.environ.get("PATH", "")})
         hits = [l.split()[0] for l in p.stderr.splitlines() if re.match(r"^[0-9a-f]{64} \d+ \d+ ", l)]
-        return hits[-1] if p.returncode == 0 and hits else None
+        h = hits[-1] if p.returncode == 0 and hits else None
+        if with_steps:
+            st = [l.split()[1:] for l in p.stderr.splitlines() if l.startswith("STEPS ")]
+            return h, (st[-1] if st else None)
+        return h
     except Exception as e:
         log("tpcds proxy failed:", repr(e))
         return None
 
 
+def _stmt_chain(tree, lo, hi):
+    """Statements (outermost first) whose span contains lines lo..hi."""
+    chain, body = [], tree.body
+    while True:
+        for s in body:
+            if first_line(s) <= lo and hi <= s.end_lineno:
+                chain.append(s)
+                break
+        else:
+            return chain
+        s = chain[-1]
+        inner = [b for f in BLOCK_FIELDS for b in (getattr(s, f, None) or [])]
+        inner = [b.body if isinstance(b, (ast.ExceptHandler, getattr(ast, "match_case", ()))) else [b]
+                 for b in inner]
+        body = [x for b in inner for x in b]
+        if not body:
+            return chain
+
+
+def _bound_names(s):
+    out = set()
+    if isinstance(s, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        for t in (s.targets if isinstance(s, ast.Assign) else [s.target]):
+            for n in ast.walk(t):
+                if isinstance(n, ast.Name):
+                    out.add(n.id)
+                elif isinstance(n, ast.Attribute):
+                    out.add(n.attr)
+        return out
+    return None
+
+
+def tpcds_region_ok(sel, rel, tree, oa, ob, why):
+    """Can this changed region influence test_execute_tpcds only through what the proxy compares?
+    The uncompared phase (setUpClass, pickling, ensure_tables/ensure_schema, Plan, PythonExecutor)
+    must not run the changed code, nor read a class or name the change rebinds at import."""
+    ph = sel.idx["tpcds_phase"]
+    U = ph["lines"].get(rel, set())
+    lo, hi = (oa, ob) if ob >= oa else (max(ob, 1), oa)
+    chain = _stmt_chain(tree, lo, hi)
+    if not chain:
+        lines = set(range(lo, hi + 1))
+    else:
+        s = chain[-1]
+        body = [b for f in BLOCK_FIELDS for b in (getattr(s, f, None) or [])]
+        top = first_line(body[0]) - 1 if body and hi < first_line(body[0]) else s.end_lineno
+        lines = set(range(first_line(s), top + 1)) | set(range(lo, hi + 1))
+    if lines & U:
+        why.append(f"{rel}:{lo} runs in the uncompared phase")
+        return False
+    il = sel.idx["importlines"].get(rel, ())
+    if not any(x in il for x in lines):
+        return True  # call-time code that the uncompared phase never runs
+    if not chain:
+        return False
+    s = chain[-1]
+    if isinstance(s, DEF_TYPES) and any(first_line(d) <= hi and lo <= d.end_lineno for d in s.decorator_list):
+        why.append(f"{rel}:{lo} decorator")
+        return False
+    if isinstance(s, FUNC_TYPES) and s.body and hi < first_line(s.body[0]):
+        # def header (defaults, annotations): only matters when the function is called
+        if set(range(first_line(s), s.end_lineno + 1)) & U:
+            why.append(f"{rel}:{lo} header of a function the uncompared phase calls")
+            return False
+        return True
+    classes = [c for c in chain if isinstance(c, ast.ClassDef)]
+    if classes:
+        c = classes[-1]
+        key = module_name(rel) + ":" + ".".join(x.name for x in classes)
+        if key in ph["classes"] or c.name in ph["names"]:
+            why.append(f"{rel}:{lo} class {c.name} is used in the uncompared phase")
+            return False
+        return True
+    names = _bound_names(s)
+    if names is None or rel in ph["lines"] or names & ph["names"]:
+        why.append(f"{rel}:{lo} module-level change")
+        return False
+    return True
+
+
 def tpcds_skippable(sel):
-    """True only if the patch is plain edits of sqlglot/*.py outside the executor/planner and the
-    proxy dump is identical to the pristine one."""
-    changed = set(sel.changed)
-    if not changed or changed != set(sel.patched):
-        return False
-    for rel in changed:
-        if not (rel.startswith("sqlglot/") and rel.endswith(".py")):
-            return False
-        if rel.startswith("sqlglot/executor/") or rel == "sqlglot/planner.py":
-            return False
+    """True only if every change can reach test_execute_tpcds only through what the proxy compares,
+    and the proxy dump of the patched source is identical to the pristine one."""
     base = sel.idx.get("tpcds_base")
-    if not base:
+    if not base or not sel.idx.get("tpcds_phase"):
         return False
-    h = tpcds_hash({str(SRC / rel): text for rel, text in sel.patched.items()})
+    why = sel.why
+    for f in sel.files:
+        rel = f["new"] or f["old"]
+        if f["binary"] or not f["old"] or not f["new"] or f["old"] != f["new"]:
+            return False
+        if rel.startswith("tests/fixtures/") and not rel.startswith("tests/fixtures/optimizer/tpc-ds/"):
+            continue  # data the test never opens
+        if not (rel.startswith("sqlglot/") and rel.endswith(".py")) or rel not in sel.patched:
+            return False
+        old = sel.read_src(rel)
+        if old is None:
+            return False
+        tree = ast.parse(old)
+        _, regions = apply_hunks(old, f["hunks"])
+        for oa, ob, _na, _nb in regions:
+            if not tpcds_region_ok(sel, rel, tree, oa, ob, why):
+                return False
+    h = tpcds_hash({str(SRC / rel): text for rel, text in sel.patched.items()}, sel.idx.get("tpcds_steps"))
     return h is not None and h == base
 
 
@@ -2218,6 +2347,7 @@ def main():
         os.chmod(INDEX, 0o644)
         log("index:", len(idx["units"]), "units", len(idx["refs"]), "names", len(idx["core"]), "core modules")
         return
+    started = time.monotonic()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     durations = [0] * len(tests)
     number_of = {}
@@ -2256,9 +2386,15 @@ def main():
                 mask, why = sel.select(text)
                 chosen = sorted(set(always) | set(numbers(mask)))
                 tp = number_of.get(TPCDS_ID)
-                if tp is not None and tp in chosen and TPCDS_ID not in getattr(sel, "always_ids", ()):
+                if tp is not None and tp in chosen and tp not in always:
+                    rest = [n for n in chosen if n != tp]
+                    saving = plan_cost(pack(chosen, durations), durations) - plan_cost(pack(rest, durations), durations)
                     try:
-                        if tpcds_skippable(sel):
+                        if saving < TPCDS_MIN_SAVING_MS:
+                            why.append(f"tpcds proxy not worth it (saves {saving} ms)")
+                        elif time.monotonic() - started > TPCDS_BUDGET_S:
+                            why.append("tpcds proxy: time budget spent")
+                        elif tpcds_skippable(sel):
                             chosen = [n for n in chosen if n != tp]
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
                     except Exception as e:
