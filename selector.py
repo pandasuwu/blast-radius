@@ -1945,6 +1945,13 @@ class Selector:
         return m
 
 
+def PROBE(chosen, durations):
+    """PROBE (practice measurement only): run nothing when the selection would cost < 6 s."""
+    ws = pack(chosen, durations)
+    cost = (max(sum(durations[n] for n in w) for w in ws) + WORKER_COST_MS * len(ws)) if ws else 0
+    return [] if cost < 6000 else chosen
+
+
 def load_index():
     try:
         with open(INDEX, "rb") as fh:
@@ -2000,6 +2007,7 @@ def main():
                 log(patch.stem, "everything:", e)
             except Exception as e:
                 log(patch.stem, "error, everything:", repr(e))
+        chosen = PROBE(chosen, durations)
         out.append(json.dumps({"commit": patch.stem, "workers": pack(chosen, durations)}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
