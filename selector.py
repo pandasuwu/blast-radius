@@ -4063,6 +4063,8 @@ for line in sys.stdin:
 """
 VERIFY_MAX_COST_MS = int(os.environ.get("BR_VERIFY_MAX_MS", "6000"))  # only selections this cheap are worth verifying (~2 s saved when all pass)
 VERIFY_HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")  # third-party deps, shared pools
+VERIFY_PARTIAL = os.environ.get("BR_VERIFY_PARTIAL", "1") == "1"  # v7.5: verify the non-heavy part of a selection
+VERIFY_PARTIAL_MIN_MS = int(os.environ.get("BR_VERIFY_PARTIAL_MIN_MS", "1000"))  # least saving worth a check
 VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET", "140"))  # wall clock since start
 # On by default (BR_VERIFY=0 turns it off). History: v5.7 had it on; on the practice board it verified 1
 # commit clean (-2.0 s simulated) for +2.4 s CPU (zygote 0.6 s, ~0.4 s per check; only ~13-20% of checks
@@ -4077,7 +4079,7 @@ class Zygote:
     def __init__(self, test_files):
         import subprocess
         mods = [f[:-3].replace("/", ".") for f in test_files if f not in VERIFY_HEAVY]
-        self.p = subprocess.Popen([sys.executable, "-I", "-c", ZYGOTE, str(SRC), json.dumps(mods)],
+        self.p = subprocess.Popen([sys.executable, "-I", "-B", "-c", ZYGOTE, str(SRC), json.dumps(mods)],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                   text=True, cwd=str(SRC),
                                   env={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "SKIP_INTEGRATION": "0",
@@ -4249,32 +4251,40 @@ def main():
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
-                if VERIFY_ON and chosen and time.monotonic() - started < VERIFY_BUDGET_S \
-                        and plan_cost(pack(chosen, durations), durations) < VERIFY_MAX_COST_MS \
-                        and not any(tests[n]["file"] in VERIFY_HEAVY for n in chosen):
+                # v7.5: tests of VERIFY_HEAVY files cannot run in the zygote; verify the rest and keep
+                # those unverified, when dropping the rest could save at least VERIFY_PARTIAL_MIN_MS
+                heavy = [n for n in chosen if tests[n]["file"] in VERIFY_HEAVY]
+                light = [n for n in chosen if tests[n]["file"] not in VERIFY_HEAVY]
+                if heavy and not (VERIFY_PARTIAL and light and plan_cost(pack(chosen, durations), durations)
+                                  - plan_cost(pack(heavy, durations), durations) >= VERIFY_PARTIAL_MIN_MS):
+                    light = []
+                if VERIFY_ON and light and time.monotonic() - started < VERIFY_BUDGET_S \
+                        and plan_cost(pack(light, durations), durations) < VERIFY_MAX_COST_MS:
                     try:
                         changes = swappable_changes(sel)
                         plan = None if changes else reload_plan(sel)
                         if changes or plan:
                             if zyg is None:
                                 zyg = Zygote(sorted({t["file"] for t in tests}))
-                            ids = [tests[n]["id"] for n in sorted(chosen)]
+                            ids = [tests[n]["id"] for n in sorted(light)]
                             v = zyg.check(changes, ids) if changes else zyg.check(None, ids, reload=plan[0],
                                                                                   overlay=plan[1])
                             keep = None if v.get("ok") else v.get("keep")
                             if keep:
                                 keep = set(keep)
-                                kept = [n for n in chosen if tests[n]["id"] in keep]
+                                kept = [n for n in light if tests[n]["id"] in keep]
                                 if kept and len(keep) == len(kept):
-                                    why.append(f"verify: {len(kept)} of {len(chosen)} fail, only those run")
-                                    chosen = kept
+                                    why.append(f"verify: {len(kept)} of {len(light)} fail, only those run"
+                                               + (f" (+{len(heavy)} unverified)" if heavy else ""))
+                                    chosen = heavy + kept
                                 else:
                                     why.append("verify: " + str(v.get("bad"))[:80])
                             else:
-                                why.append("verify: " + ("all pass, nothing to run" if v.get("ok")
+                                why.append("verify: " + ((f"{len(light)} pass, {len(heavy)} unverified kept" if heavy
+                                                          else "all pass, nothing to run") if v.get("ok")
                                                          else str(v.get("bad"))[:80]))
                             if v.get("ok"):
-                                chosen = []
+                                chosen = heavy
                     except Exception as e:
                         log(patch.stem, "verify error:", repr(e))
                 try:
