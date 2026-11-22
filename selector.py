@@ -2605,11 +2605,14 @@ def tpcds_skippable(sel, budget=0.0):
                 xc = sel.idx.get("tpcds_xcov")
                 if not hasattr(sel, "pj_group"):
                     # PROBE J: which file and why the execution proof needs its queries
-                    sel.pj_group = (1 if rel == "sqlglot/serde.py" else 2 if rel.startswith("sqlglot/executor/")
-                                    else 3 if rel == "sqlglot/planner.py" else 4 if rel.startswith("sqlglot/optimizer/")
-                                    else 5 if rel.startswith("sqlglot/expressions") else 6)
-                    sel.pj_reason = 1 if xc is not None and lines & il else 2 if xc is None or not any(
-                        isinstance(s, FUNC_TYPES) for s in chain) else 3
+                    # PROBE K: CPU +2 s x file, sim +2 s x (1 ENV dict, 2 other module-level stmt, 3 class/def)
+                    sel.pj_group = (1 if rel == "sqlglot/executor/python.py" else 2 if rel == "sqlglot/executor/env.py"
+                                    else 3 if rel.startswith("sqlglot/executor/") else 4 if rel == "sqlglot/serde.py"
+                                    else 5)
+                    top = chain[0] if chain else None
+                    tnames = {t.id for t in getattr(top, "targets", [getattr(top, "target", None)]) if isinstance(t, ast.Name)}
+                    sel.pj_reason = 1 if "ENV" in tnames else 2 if top is not None and not isinstance(
+                        top, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else 3
                 if xc is None or lines & il or not any(isinstance(s, FUNC_TYPES) for s in chain):
                     exec_set = None  # import-time change, or no map: execute every query
                 elif exec_set is not None:
@@ -3085,7 +3088,7 @@ def main():
             t_busy = time.process_time()
             while time.process_time() - t_busy < 2.0 * group:
                 pass
-            log(patch.stem, "PROBE J:", group, reason)
+            log(patch.stem, "PROBE K:", group, reason)
           except Exception as e:
             log(patch.stem, "PROBE J failed:", repr(e))
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
