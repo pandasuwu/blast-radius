@@ -3927,13 +3927,29 @@ with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
 print("READY", flush=True)
 
 
+def plan_cost(ms, worker_ms=2000, max_workers=8):
+    # selector.pack + plan_cost on bare durations: best LPT makespan + worker cost over k workers
+    items = sorted(ms, reverse=True)
+    best = 0
+    for k in range(1, min(max_workers, len(items)) + 1):
+        loads = [0] * k
+        for x in items:
+            loads[loads.index(min(loads))] += x
+        c = max(loads) + worker_ms * k
+        best = c if best == 0 else min(best, c)
+    return best
+
+
 class Result(unittest.TestResult):
-    # runs every test (no stop at the first failure) and records each failing one
-    def __init__(self):
+    # runs every test (no stop at the first failure) and records each failing one; with `stop`, ends the
+    # run once even the best case (all tests not yet run pass) saves less than stop["min"] ms; the rest is kept unrun
+    def __init__(self, stop=None, uid=None):
         super().__init__()
         self.bad = None
         self.failed = []  # unittest ids, first failure first
         self.started = set()
+        self.stopinfo, self.uid = stop, uid or {}
+        self.early = False
     def startTest(self, test):
         super().startTest(test)
         self.started.add(getattr(test, "id", lambda: str(test))())
@@ -3943,6 +3959,14 @@ class Result(unittest.TestResult):
             self.bad = (tid, kind)
         if tid not in self.failed:
             self.failed.append(tid)
+            st = self.stopinfo
+            if st:
+                dur = st["dur"]
+                # best case from here: every test not yet run passes; the failures so far are kept
+                kept = list(st["fixed"]) + [dur.get(self.uid.get(u, u), 0) for u in self.failed]
+                if st["before"] - plan_cost(kept) < st["min"]:
+                    self.early = True
+                    self.stop()
     def addError(self, test, err): self._fail(test, "error")
     def addFailure(self, test, err): self._fail(test, "failure")
     def addUnexpectedSuccess(self, test): self._fail(test, "unexpected success")
@@ -4027,10 +4051,10 @@ def child(req):
         t = getattr(m, cls)(meth)
         uid[t.id()] = tid
         suite.addTest(t)
-    res = Result()
+    res = Result(req.get("stop"), uid)
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         suite.run(res)
-    out = {"ok": res.bad is None, "bad": res.bad, "ran": res.testsRun}
+    out = {"ok": res.bad is None, "bad": res.bad, "ran": res.testsRun, "early": res.early}
     if res.bad is not None and all(f in uid for f in res.failed):
         # every failure belongs to one of the requested tests (not setUpClass/setUpModule): report
         # them, plus the tests that never started, as the ones still to run
@@ -4063,6 +4087,9 @@ for line in sys.stdin:
 """
 VERIFY_MAX_COST_MS = int(os.environ.get("BR_VERIFY_MAX_MS", "6000"))  # only selections this cheap are worth verifying (~2 s saved when all pass)
 VERIFY_HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")  # third-party deps, shared pools
+VERIFY_STOP = os.environ.get("BR_VERIFY_STOP", "1") == "1"  # v7.4.3: early stop when nothing is left to save
+VERIFY_STOP_MIN_MS = int(os.environ.get("BR_VERIFY_STOP_MIN_MS", "300"))
+VPROF = os.environ.get("BR_VPROF") == "1"  # eval only: log the verifier's CPU per check
 VERIFY_PARTIAL = os.environ.get("BR_VERIFY_PARTIAL", "1") == "1"  # v7.5: verify the non-heavy part of a selection
 VERIFY_PARTIAL_MIN_MS = int(os.environ.get("BR_VERIFY_PARTIAL_MIN_MS", "1000"))  # least saving worth a check
 VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET", "140"))  # wall clock since start
@@ -4091,11 +4118,13 @@ class Zygote:
         r, _, _ = select.select([self.p.stdout], [], [], timeout)
         return self.p.stdout.readline().strip() if r else None
 
-    def check(self, changes, ids, timeout=20, reload=None, overlay=None):
+    def check(self, changes, ids, timeout=20, reload=None, overlay=None, stop=None):
         if not self.ok:
             return {"ok": False, "bad": ["zygote down"]}
         try:
             req = {"changes": changes or [], "ids": ids}
+            if stop is not None:
+                req["stop"] = stop
             if reload is not None:
                 req.update(reload=reload, overlay=overlay)
             self.p.stdin.write(json.dumps(req) + "\n")
@@ -4109,6 +4138,14 @@ class Zygote:
             self.close()
             return {"ok": False, "bad": ["timeout"]}
         return json.loads(line[7:])
+
+    def cpu_ms(self):
+        """CPU the zygote and its reaped checkers used so far (Linux /proc), or None."""
+        try:
+            f = open(f"/proc/{self.p.pid}/stat").read().rsplit(")", 1)[1].split()
+            return (int(f[11]) + int(f[12]) + int(f[13]) + int(f[14])) * 1000 // os.sysconf("SC_CLK_TCK")
+        except Exception:
+            return None
 
     def close(self):
         try:
@@ -4264,11 +4301,20 @@ def main():
                         changes = swappable_changes(sel)
                         plan = None if changes else reload_plan(sel)
                         if changes or plan:
+                            vt0 = time.process_time()
                             if zyg is None:
                                 zyg = Zygote(sorted({t["file"] for t in tests}))
+                                if VPROF:
+                                    log(patch.stem, "VPROF start", zyg.cpu_ms())
+                            vc0 = zyg.cpu_ms() if VPROF else None
+                            before = plan_cost(pack(chosen, durations), durations)
                             ids = [tests[n]["id"] for n in sorted(light)]
-                            v = zyg.check(changes, ids) if changes else zyg.check(None, ids, reload=plan[0],
-                                                                                  overlay=plan[1])
+                            # v7.4.3: stop the check once its failures leave less than VERIFY_STOP_MIN_MS to save
+                            stop = {"dur": {tests[n]["id"]: durations[n] for n in light},
+                                    "fixed": [durations[n] for n in heavy], "before": before,
+                                    "min": VERIFY_STOP_MIN_MS} if VERIFY_STOP else None
+                            v = zyg.check(changes, ids, stop=stop) if changes else \
+                                zyg.check(None, ids, reload=plan[0], overlay=plan[1], stop=stop)
                             keep = None if v.get("ok") else v.get("keep")
                             if keep:
                                 keep = set(keep)
@@ -4285,6 +4331,16 @@ def main():
                                                          else str(v.get("bad"))[:80]))
                             if v.get("ok"):
                                 chosen = heavy
+                            if VPROF:
+                                vc1 = zyg.cpu_ms()
+                                log(patch.stem, "VPROF", json.dumps({
+                                    "light": len(light), "light_ms": sum(durations[n] for n in light),
+                                    "light_cost": plan_cost(pack(light, durations), durations), "heavy": len(heavy),
+                                    "before": before, "after": plan_cost(pack(chosen, durations), durations),
+                                    "pot": before - plan_cost(pack(heavy, durations), durations) if heavy else before,
+                                    "zcpu": None if vc0 is None or vc1 is None else vc1 - vc0,
+                                    "scpu": round((time.process_time() - vt0) * 1000), "kind": "swap" if changes else "reload",
+                                    "ok": bool(v.get("ok")), "early": bool(v.get("early"))}))
                     except Exception as e:
                         log(patch.stem, "verify error:", repr(e))
                 try:
