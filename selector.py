@@ -3790,6 +3790,7 @@ VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET", "140"))  # wall clock
 # Off by default: on the practice board v5.7 verified 1 commit clean (-2.0 s simulated) for +2.4 s CPU
 # (zygote 0.6 s, ~0.4 s per check; only ~13-20% of checks end in "all pass"). BR_VERIFY=1 turns it on.
 VERIFY_ON = os.environ.get("BR_VERIFY", "1") == "1"
+PROBE_N_CLASS = os.environ.get("BR_PROBE_N", "U")  # PROBE N (measurement only): class whose selection is dropped
 
 
 class Zygote:
@@ -3970,6 +3971,7 @@ def main():
                             why.append("tpcds proxy: identical, test_execute_tpcds left out")
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
+                verdict = None  # PROBE N
                 if VERIFY_ON and chosen and time.monotonic() - started < VERIFY_BUDGET_S \
                         and plan_cost(pack(chosen, durations), durations) < VERIFY_MAX_COST_MS \
                         and not any(tests[n]["file"] in VERIFY_HEAVY for n in chosen):
@@ -3982,6 +3984,7 @@ def main():
                             ids = [tests[n]["id"] for n in sorted(chosen)]
                             v = zyg.check(changes, ids) if changes else zyg.check(None, ids, reload=plan[0],
                                                                                   overlay=plan[1])
+                            verdict = v  # PROBE N
                             why.append("verify: " + ("all pass, nothing to run" if v.get("ok")
                                                      else str(v.get("bad"))[:80]))
                             if v.get("ok"):
@@ -3992,6 +3995,18 @@ def main():
                     tiers = [numbers(m) for m in getattr(sel, "plausible", ())] + [everything]
                 except Exception as e:
                     log(patch.stem, "free riders off:", repr(e))
+                # PROBE N (measurement only): run nothing for one class of final selections that do
+                # not hold test_execute_tpcds. H: holds a VERIFY_HEAVY test (never verifiable);
+                # U: no heavy test, verifier gave no verdict; F: verifier saw a failure.
+                # Board: sim saving = cost of that class on practice, commits missed = its failing commits.
+                if chosen and (tp is None or tp not in chosen):
+                    bad = (verdict or {}).get("bad") or [""]
+                    pm = "H" if any(tests[n]["file"] in VERIFY_HEAVY for n in chosen) else \
+                        "F" if str(bad[0]).startswith("tests.") else "U"
+                    if pm == PROBE_N_CLASS:
+                        why.insert(0, f"PROBE N: class {pm} dropped ({plan_cost(pack(chosen, durations), durations)} ms)")
+                        chosen = []
+                        tiers = []
                 log(patch.stem, len(chosen), "tests;", "; ".join(why)[:300])
             except Everything as e:
                 log(patch.stem, "everything:", e)
