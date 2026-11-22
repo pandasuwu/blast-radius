@@ -3119,6 +3119,13 @@ if EXEC_SET is not None:
     EXEC_SET = set(EXEC_SET)
 sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
 parts, todo, est, tables = [], [], 0.0, {}
+# v7.3 early abort: project the whole proof's cost from the first queries' real speed and give up
+# at once when it will not fit, instead of declining late after spending the budget
+REM_REF = DONE_REF = DONE_TOOK = 0.0
+N_DONE = 0
+if REF is not None and EXEC_ALL:
+    REM_REF = sum(REF["sec"].get(str(i), 0.0) for i, (meta, _s, _) in enumerate(sqls)
+                  if meta.get("execute") and (ONLY is None or i in ONLY) and (EXEC_SET is None or i in EXEC_SET))
 for i, (meta, sql, _) in enumerate(sqls):
     if REF is not None and ONLY is not None and i not in ONLY:
         continue
@@ -3173,6 +3180,14 @@ for i, (meta, sql, _) in enumerate(sqls):
         est += max(0.0, took - REF["sec"][str(i)])
         if est > BUDGET:
             verdict(ok=False, why=f"query {i}: execution needs more than the budget")
+        if will_run:
+            N_DONE += 1
+            DONE_REF += REF["sec"][str(i)]
+            DONE_TOOK += took
+            REM_REF -= REF["sec"][str(i)]
+            ahead = max(0.0, REM_REF) * DONE_TOOK / max(DONE_REF, 1e-3)
+            if N_DONE >= 3 and (est + ahead > BUDGET or time.process_time() - t0 + ahead > LIMIT):
+                verdict(ok=False, why=f"query {i}: projected execution cost is over the budget")
         if duck_changed or (strict != REF["res"][str(i)] and loose != REF["lres"][str(i)]):
             # rows or reference differ from pristine: decide exactly as the test does
             if not REF.get("dres"):
