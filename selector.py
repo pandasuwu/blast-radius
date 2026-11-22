@@ -928,8 +928,8 @@ def build_index():
         idx["tpcds_base"] = None
     log("tpcds proxy baseline:", idx["tpcds_base"])
     try:
-        # off by default (BR_STATE=1): on the labelled sets it did not pay for its CPU
-        idx["state_ref"] = build_state_ref(idx) if os.environ.get("BR_STATE", "0") == "1" else None
+        # on by default since v7.2 (BR_STATE=0 turns it off)
+        idx["state_ref"] = build_state_ref(idx) if os.environ.get("BR_STATE", "1") == "1" else None
     except Exception as e:
         log("state diff disabled:", repr(e))
         idx["state_ref"] = None
@@ -1234,7 +1234,7 @@ class Selector:
         """An import-time code change: decided by the state diff at the end of select() (readers of
         every module global / class attribute whose import-time value changed); `fallback` is
         selected instead if the diff cannot run."""
-        if self.idx.get("state_ref") and os.environ.get("BR_STATE", "0") == "1":
+        if self.idx.get("state_ref") and os.environ.get("BR_STATE", "1") == "1":
             self.pending_state.append(fallback)
             return 0
         return fallback
