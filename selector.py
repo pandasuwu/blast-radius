@@ -2621,6 +2621,8 @@ def tpcds_skippable(sel, budget=0.0):
     # a patch can make the optimizer very slow: cap the check's wall clock (a timeout keeps the test)
     if exec_all:
         qs = None if exec_set is None else [i for i in range(exec_set.bit_length()) if exec_set >> i & 1]
+        if qs is None and hasattr(sel, "pj_group"):
+            sel.pj_ok = True  # PROBE K2: mark the execute-all commit whatever the proof decides
         est = sum(v for k, v in sel.idx["tpcds_ref"]["sec"].items() if qs is None or int(k) in qs)
         # pay at most the saving minus the comparison pass and a 2 s net gain
         # break-even: the parse pass (~2.5 s) plus execution must stay under the test's own time
@@ -3021,6 +3023,9 @@ def main():
     zyg = None
     out = []
     for patch in patches:
+        if sel is not None:  # PROBE K2: markers are per commit
+            sel.__dict__.pop("pj_group", None)
+            sel.pj_ok = False
         chosen = everything
         tiers = []
         if sel is not None:
@@ -3045,6 +3050,8 @@ def main():
                                 PJ[patch.stem] = (sel.pj_group, sel.pj_reason)
                     except Exception as e:
                         log(patch.stem, "tpcds check error:", repr(e))
+                    if getattr(sel, "pj_ok", False):
+                        PJ[patch.stem] = (sel.pj_group, sel.pj_reason)  # PROBE K2
                 if VERIFY_ON and chosen and time.monotonic() - started < VERIFY_BUDGET_S \
                         and plan_cost(pack(chosen, durations), durations) < VERIFY_MAX_COST_MS \
                         and not any(tests[n]["file"] in VERIFY_HEAVY for n in chosen):
