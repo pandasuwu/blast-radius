@@ -3619,7 +3619,9 @@ def tpcds_skippable(sel, budget=0.0):
                     exec_set = None  # import-time change, or no map: execute every query
                     if lines & il and getattr(sel, "pm", None) is None and rel.startswith("sqlglot/executor/")                             and rel not in ("sqlglot/executor/python.py", "sqlglot/executor/env.py"):
                         try:
-                            sel.pm = _pm_classify(sel, rel, tree, oa, ob, na, nb, lo, hi)
+                            k = _pm_classify(sel, rel, tree, oa, ob, na, nb, lo, hi)
+                            # PROBE M2: (file, pure insertion, old chain empty, old line, M's kind)
+                            sel.pm = (k[1], 1 if ob < oa else 0, 0 if chain else 1, lo, k[0])
                         except Exception as e:
                             log("PROBE M classify failed:", repr(e))
                 elif exec_set is not None:
@@ -4091,19 +4093,26 @@ def main():
             workers = pack(chosen, durations)
         if sel is not None and getattr(sel, "pm_fire", False) and sel.pm is not None:
             try:
-                # PROBE M: sim +2 s x kind (+ v ms: line bucket), CPU +2.5 s x (file + 4 r)
-                kind, fcode, r, v = sel.pm
+                # PROBE M2: sim + 2 s x (file + 3 ins) + v ms on the critical worker, v = 1 + line // 4;
+                # CPU + 10 s when the old-tree statement chain is empty
+                fcode, ins, empty, line, kind = sel.pm
                 workers = [w for w in workers if w]
                 used = {n for w in workers for n in w}
                 free = [n for n in range(len(durations)) if n not in used]
+                v = min(40, 1 + max(line, 0) // 4)
                 lt = min(free, key=lambda n: (abs(durations[n] - v), n))
                 zero = sorted((n for n in free if n != lt), key=lambda n: (durations[n], n))
-                marks = [[lt]] + [[n] for n in zero[:kind - 1]]
-                workers += marks[:max(0, MAX_WORKERS - len(workers))]
+                crit = max(workers, key=lambda w: sum(durations[n] for n in w)) if workers else None
+                if crit is not None:
+                    crit.append(lt)
+                else:
+                    workers.append([lt])
+                nmark = fcode + 3 * ins
+                workers += [[n] for n in zero[:nmark]][:max(0, MAX_WORKERS - len(workers))]
                 t_busy = time.process_time()
-                while time.process_time() - t_busy < 2.5 * (fcode + 4 * r):
+                while time.process_time() - t_busy < 10.0 * empty:
                     pass
-                log(patch.stem, "PROBE M:", kind, fcode, r, v, "line test ms", durations[lt])
+                log(patch.stem, "PROBE M2:", fcode, ins, empty, line, kind, "v", v, "line test ms", durations[lt])
             except Exception as ex:
                 log(patch.stem, "PROBE M failed:", repr(ex))
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
