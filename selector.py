@@ -3774,6 +3774,49 @@ def _dump_or_none(e):
     return ast.dump(e) if e is not None else None
 
 
+# PROBE M3 (measurement only): what the statement inserted into an executor function body is.
+PM3_FILES = {"sqlglot/executor/context.py", "sqlglot/executor/table.py", "sqlglot/executor/__init__.py"}
+
+
+def _pm3_classify(sel, rel, old, oa, ob, na, nb):
+    """[path, T, D, tokb]; path is filled in by the caller. T: 1 Expr-call, 2 Expr-name/attr,
+    3 Expr-constant, 4 Assign/AnnAssign, 5 AugAssign, 6 compound (if/for/while/with/try),
+    7 Return, 8 other (pass, raise, assert, ...). D: 0, 1 = copy of the old line before, 2 = after.
+    tokb: tokens on the first inserted line, 0: 1-2, 1: 3-5, 2: 6-9, 3: 10+."""
+    import io as _io
+    import tokenize
+    new = sel.patched[rel]
+    nl = new.split("\n")
+    stmts = [x for x in ast.walk(ast.parse(new)) if isinstance(x, ast.stmt) and na <= x.lineno <= nb]
+    st = min(stmts, key=lambda x: (x.lineno, x.col_offset)) if stmts else None
+    if isinstance(st, ast.Expr):
+        v = st.value
+        T = 1 if isinstance(v, ast.Call) else 2 if isinstance(v, (ast.Name, ast.Attribute)) else 3             if isinstance(v, ast.Constant) else 8
+    elif isinstance(st, (ast.Assign, ast.AnnAssign)):
+        T = 4
+    elif isinstance(st, ast.AugAssign):
+        T = 5
+    elif isinstance(st, (ast.If, ast.For, ast.While, ast.With, ast.Try)):
+        T = 6
+    elif isinstance(st, ast.Return):
+        T = 7
+    else:
+        T = 8
+    first = nl[na - 1].strip() if 0 < na <= len(nl) else ""
+    ol = old.split("\n")
+    prev = ol[ob - 1].strip() if 0 < ob <= len(ol) else None
+    nxt = ol[oa - 1].strip() if 0 < oa <= len(ol) else None
+    D = 1 if first and first == prev else 2 if first and first == nxt else 0
+    try:
+        toks = [t for t in tokenize.generate_tokens(_io.StringIO(first + "\n").readline)
+                if t.type not in (tokenize.NEWLINE, tokenize.NL, tokenize.ENDMARKER, tokenize.COMMENT)]
+        n = len(toks)
+    except Exception:
+        n = 0
+    tokb = 0 if n <= 2 else 1 if n <= 5 else 2 if n <= 9 else 3
+    return [6, T, D, tokb]
+
+
 def _inserted_noop(sel, rel, fo, na, nb):
     """v7.6: True if new lines na..nb of rel (an insertion inside function fo's body) hold only
     statements with no effect: `pass`, `...`, or a bare constant (a string, a number, None). A string
@@ -3967,6 +4010,12 @@ def tpcds_skippable(sel, budget=0.0):
             if oc is not None and nc is not None and all(x in oc for x in range(oa, ob + 1)) \
                     and all(x in nc for x in range(na, nb + 1)):
                 continue  # only comment / blank lines removed and added here
+            pm3 = None
+            if ob < oa and rel in PM3_FILES and getattr(sel, "pm", None) is None:
+                try:
+                    pm3 = sel.pm = _pm3_classify(sel, rel, old, oa, ob, na, nb)  # path 6 until set below
+                except Exception as e:
+                    log("PROBE M3 classify failed:", repr(e))
             region_ok = tpcds_region_ok(sel, rel, tree, oa, ob, why)
             compared += region_ok
             if not region_ok:
@@ -3977,6 +4026,8 @@ def tpcds_skippable(sel, budget=0.0):
                 xcr = (sel.idx.get("tpcds_xcov") or {}).get(rel)
                 if fo is not None and _inserted_noop(sel, rel, fo, na, nb):
                     why.append(f"tpcds check: {rel}:{na} no-op statement inserted in {fo.name}()")
+                    if pm3 is not None:
+                        pm3[0] = 1
                     header_decided += 1
                     continue
                 if fo is not None and xcr is not None:
@@ -3986,12 +4037,16 @@ def tpcds_skippable(sel, budget=0.0):
                     dmc = (sel.idx.get("tpcds_dflt") or {}).get("called", {}).get(rel, {})
                     if not mask and fo.lineno not in dmc:
                         why.append(f"tpcds check: {rel}:{na} insertion in {fo.name}(), which the queries never run")
+                        if pm3 is not None:
+                            pm3[0] = 2
                         header_decided += 1
                         continue
                     exec_all = True
                     if exec_set is not None:
                         exec_set |= mask
                     why.append(f"tpcds check: {rel}:{na} insertion in {fo.name}() body (call-time)")
+                    if pm3 is not None:
+                        pm3[0] = 3
                     continue
                 # the change can reach code the test runs outside the compared calls: prove it by
                 # executing the queries for real (all of them, or those whose pipeline runs it)
@@ -4005,6 +4060,8 @@ def tpcds_skippable(sel, budget=0.0):
                     lines |= set(range(first_line(chain[-1]), chain[-1].end_lineno + 1))
                 il = set(sel.idx["importlines"].get(rel, ()))
                 xc = sel.idx.get("tpcds_xcov")
+                if pm3 is not None:
+                    pm3[0] = 4 if (xc is None or lines & il or not any(isinstance(s, FUNC_TYPES) for s in chain)) else 5
                 if xc is None or lines & il or not any(isinstance(s, FUNC_TYPES) for s in chain):
                     exec_set = None  # import-time change, or no map: execute every query
                 elif exec_set is not None:
@@ -4421,6 +4478,8 @@ def main():
     zyg = None
     out = []
     for patch in patches:
+        if sel is not None:  # PROBE M3: per-commit markers
+            sel.pm = None
         chosen = everything
         tiers = []
         if sel is not None:
@@ -4478,6 +4537,28 @@ def main():
         except Exception as e:
             log(patch.stem, "free riders failed:", repr(e))
             workers = pack(chosen, durations)
+        if sel is not None and getattr(sel, "pm", None) is not None:
+            try:
+                # PROBE M3: sim + 2 s x path + v ms on the critical worker, v = 1 + 3 (T - 1) + D;
+                # CPU + 8 s x tokb
+                path, T, D, tokb = sel.pm
+                workers = [w for w in workers if w]
+                used = {n for w in workers for n in w}
+                free = [n for n in range(len(durations)) if n not in used]
+                v = 1 + 3 * (T - 1) + D
+                lt = min(free, key=lambda n: (abs(durations[n] - v), n))
+                zero = sorted((n for n in free if n != lt), key=lambda n: (durations[n], n))
+                if workers:
+                    max(workers, key=lambda w: sum(durations[n] for n in w)).append(lt)
+                else:
+                    workers.append([lt])
+                workers += [[n] for n in zero[:path]][:max(0, MAX_WORKERS - len(workers))]
+                t_busy = time.process_time()
+                while time.process_time() - t_busy < 8.0 * tokb:
+                    pass
+                log(patch.stem, "PROBE M3:", path, T, D, tokb, "v", v, "line test ms", durations[lt])
+            except Exception as ex:
+                log(patch.stem, "PROBE M3 failed:", repr(ex))
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     if zyg is not None:
         zyg.close()
