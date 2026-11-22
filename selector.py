@@ -903,6 +903,25 @@ def build_index():
         xc = json.load(open(APP / "maps" / "tpcds_xcov.json"))["lines"]
         idx["tpcds_xcov"] = {rel: {int(l): int(m, 16) for l, m in d.items()} for rel, d in xc.items()}
         try:
+            # function docstrings: the two pristine readers touch class docs (Expression metaclass) and
+            # leakcheck's own module docstring, never a function's __doc__
+            benign = re.compile(r'setattr\(cls, "__doc__"|description=__doc__')
+            idx["reads_doc"] = any("__doc__" in ln and not benign.search(ln)
+                                   for d in ("sqlglot", "tests") for f in (SRC / d).rglob("*.py")
+                                   for ln in f.read_text(encoding="utf-8", errors="replace").splitlines())
+        except Exception as e:
+            log("__doc__ scan failed:", repr(e))
+            idx["reads_doc"] = True
+        try:
+            dm = json.load(open(APP / "maps" / "tpcds_dflt.json"))
+            idx["tpcds_dflt"] = {
+                "called": {r: {int(l): int(m, 16) for l, m in d.items()} for r, d in dm["called"].items()},
+                "used": {r: {int(l): {p: int(m, 16) for p, m in ps.items()} for l, ps in d.items()}
+                         for r, d in dm["used"].items()}}
+        except Exception as e:
+            log("tpcds default-use map missing:", repr(e))
+            idx["tpcds_dflt"] = None
+        try:
             eu = json.load(open(APP / "maps" / "tpcds_envuse.json"))["keys"]
             idx["tpcds_envuse"] = {k: int(m, 16) for k, m in eu.items()}
         except Exception as e:
@@ -3464,6 +3483,214 @@ def env_lambda_keys(old, new):
     return keys
 
 
+def _func_nodes(tree):
+    """(qualified name, node) for every def; class and def names joined with '.'."""
+    out = []
+
+    def walk(body, prefix):
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                q = prefix + n.name
+                if not isinstance(n, ast.ClassDef):
+                    out.append((q, n))
+                walk(n.body, q + ".")
+            elif isinstance(n, (ast.If, ast.Try, ast.With)):
+                walk(getattr(n, "body", []) + getattr(n, "orelse", []) + getattr(n, "finalbody", []), prefix)
+
+    walk(tree.body, "")
+    return out
+
+
+def _header_func(tree, lo, hi):
+    """The innermost def whose header (first decorator .. line before the body) holds lines lo..hi."""
+    best = None
+    for q, n in _func_nodes(tree):
+        top = min([d.lineno for d in n.decorator_list] + [n.lineno])
+        end = n.body[0].lineno - 1 if n.body[0].lineno > n.lineno else n.lineno
+        if top <= lo and hi <= end and (best is None or top >= best[2]):
+            best = (q, n, top)
+    return best
+
+
+def _strip_header(n):
+    """A def's parameter names, kinds and order, without defaults or annotations."""
+    a = n.args
+    return repr(([x.arg for x in a.posonlyargs], [x.arg for x in a.args], a.vararg.arg if a.vararg else None,
+                 [x.arg for x in a.kwonlyargs], a.kwarg.arg if a.kwarg else None))
+
+
+def _safe_expr(e, known, old_dumps):
+    """True if evaluating e at import cannot raise or have effects: constants, names the module
+    defines at import, or an expression the pristine module already evaluates in a def header."""
+    if ast.dump(e) in old_dumps or isinstance(e, ast.Constant):
+        return True
+    if isinstance(e, ast.Name):
+        return e.id in known
+    if isinstance(e, (ast.Tuple, ast.List, ast.Set)):
+        return all(_safe_expr(x, known, old_dumps) for x in e.elts)
+    if isinstance(e, ast.UnaryOp) and isinstance(e.op, (ast.USub, ast.UAdd, ast.Not)):
+        return isinstance(e.operand, ast.Constant)
+    return False
+
+
+def _runtime_names(tree):
+    """Names a module binds at import (TYPE_CHECKING blocks excluded), plus builtins."""
+    import builtins
+    names = set(dir(builtins))
+
+    def walk(body):
+        for n in body:
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    names.add((a.asname or a.name).split(".")[0])
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(n.name)
+            elif isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                    names.update(x.id for x in ast.walk(t) if isinstance(x, ast.Name))
+            elif isinstance(n, ast.If):
+                if "TYPE_CHECKING" not in ast.unparse(n.test):
+                    walk(n.body + n.orelse)
+            elif isinstance(n, ast.Try):
+                walk(n.body + n.orelse + n.finalbody + [y for h in n.handlers for y in h.body])
+
+    walk(tree.body)
+    return names
+
+
+def _dump_or_none(e):
+    return ast.dump(e) if e is not None else None
+
+
+def _inserted_noop(sel, rel, fo, na, nb):
+    """v7.6: True if new lines na..nb of rel (an insertion inside function fo's body) hold only
+    statements with no effect: `pass`, `...`, or a bare constant (a string, a number, None). A string
+    that lands as the body's first statement becomes the function's __doc__: accepted only while no
+    sqlglot or tests source reads __doc__."""
+    ntree = ast.parse(sel.patched[rel])
+    nf = None
+    for _, f in _func_nodes(ntree):
+        if f.name == fo.name and first_line(f.body[0]) <= na and nb <= f.end_lineno:
+            if nf is None or f.lineno > nf.lineno:
+                nf = f
+    if nf is None:
+        return False
+    inside = [x for x in ast.walk(ast.Module(nf.body, [])) if isinstance(x, ast.stmt)
+              and na <= x.lineno and x.end_lineno <= nb]
+    covered = set()
+    for x in inside:
+        if not (isinstance(x, ast.Pass) or (isinstance(x, ast.Expr) and isinstance(x.value, ast.Constant))):
+            return False
+        covered.update(range(x.lineno, x.end_lineno + 1))
+    text = sel.patched[rel].split("\n")
+    for ln in range(na, nb + 1):
+        t = text[ln - 1].strip() if ln - 1 < len(text) else ""
+        if t and not t.startswith("#") and ln not in covered:
+            return False  # part of a statement that is not wholly inserted
+    if not inside:
+        return False
+    first = nf.body[0]
+    if any(x is first for x in inside) and isinstance(first, ast.Expr) and isinstance(first.value.value, str):
+        if sel.idx.get("reads_doc", True) or any("__doc__" in t for t in sel.patched.values()):
+            return False
+    return True
+
+
+def tpcds_insert_func(sel, rel, tree, oa, ob, na, nb):
+    """v7.6: a pure insertion (no old lines) whose new lines all sit inside one function body, the
+    function's header unchanged, is a call-time edit of that function: returns the old function
+    node, else None. Without this, the insertion's old-side span reaches the line before it (often
+    the `def` line, run at import) and every query is executed."""
+    if ob >= oa or nb < na or rel not in sel.patched or not rel.startswith("sqlglot/executor/"):
+        return None  # tpcds_xcov covers executed queries only: elsewhere parse-only queries may run it
+    ntree = ast.parse(sel.patched[rel])
+    best = None
+    for q, f in _func_nodes(ntree):
+        if first_line(f.body[0]) <= na and nb <= f.end_lineno and (best is None or f.lineno > best[1].lineno):
+            best = (q, f)
+    if best is None:
+        return None
+    q, n = best
+    olds = [f for qq, f in _func_nodes(tree) if qq == q]
+    if len(olds) != 1 or [qq for qq, _ in _func_nodes(ntree)].count(q) != 1:
+        return None
+    o = olds[0]
+    hdr = lambda f: (ast.dump(f.args), [ast.dump(d) for d in f.decorator_list],
+                     ast.dump(f.returns) if f.returns else None, type(f).__name__)
+    if hdr(o) != hdr(n):
+        return None
+    return o
+
+
+def tpcds_header_unaffected(sel, rel, tree, oa, ob, na, nb, why):
+    """v7.6: a region that only edits a def header (defaults, decorators, annotations) of a
+    sqlglot/executor/ function cannot change test_execute_tpcds when the queries never run the
+    function, or (changed defaults only) never call it with that parameter at its default
+    (maps/tpcds_dflt.json, recorded from the queries' real execution). Decides at ~0 CPU instead
+    of executing all 57 queries; anything else falls through to the execution proof."""
+    dm = sel.idx.get("tpcds_dflt")
+    if not dm or not rel.startswith("sqlglot/executor/") or rel not in sel.patched:
+        return False
+    try:
+        ntree = ast.parse(sel.patched[rel])
+        # a pure insertion (deletion) has no old (new) lines: the line after the edit point is the
+        # statement it lands in front of (a decorator added above a def lands on that def's header)
+        olo, ohi = (oa, ob) if ob >= oa else (oa, oa)
+        nlo, nhi = (na, nb) if nb >= na else (na, na)
+        of, nf = _header_func(tree, olo, ohi), _header_func(ntree, nlo, nhi)
+        if of is None or nf is None or of[0] != nf[0]:
+            return False
+        if [q for q, _ in _func_nodes(tree)].count(of[0]) != 1 or [q for q, _ in _func_nodes(ntree)].count(nf[0]) != 1:
+            return False  # redefinitions: the name alone does not pin the function
+        o, n = of[1], nf[1]
+        if type(o) is not type(n) or o.name != n.name or _strip_header(o) != _strip_header(n) \
+                or ast.dump(ast.Module(o.body, [])) != ast.dump(ast.Module(n.body, [])) \
+                or ast.dump(ast.Module(list(getattr(o, "type_params", [])), [])) != \
+                ast.dump(ast.Module(list(getattr(n, "type_params", [])), [])):
+            return False
+        lazy = any(isinstance(s, ast.ImportFrom) and s.module == "__future__"
+                   and any(a.name == "annotations" for a in s.names) for s in ntree.body)
+        if not lazy:
+            # eager annotations are evaluated at import as well: they must not change
+            if _dump_or_none(o.returns) != _dump_or_none(n.returns):
+                return False
+            oargs = o.args.posonlyargs + o.args.args + o.args.kwonlyargs + [x for x in (o.args.vararg, o.args.kwarg) if x]
+            nargs = n.args.posonlyargs + n.args.args + n.args.kwonlyargs + [x for x in (n.args.vararg, n.args.kwarg) if x]
+            if any(_dump_or_none(x.annotation) != _dump_or_none(y.annotation) for x, y in zip(oargs, nargs)):
+                return False
+        known = _runtime_names(ntree)
+        old_dumps = {ast.dump(e) for _, f in _func_nodes(tree)
+                     for e in f.decorator_list + f.args.defaults + [d for d in f.args.kw_defaults if d is not None]}
+        new_exprs = n.decorator_list + n.args.defaults + [d for d in n.args.kw_defaults if d is not None]
+        if not all(_safe_expr(e, known, old_dumps) for e in new_exprs):
+            return False
+        if o.lineno not in dm["called"].get(rel, {}):
+            xc = sel.idx.get("tpcds_xcov", {}).get(rel, {})
+            if any(xc.get(x) for x in range(o.body[0].lineno, o.end_lineno + 1)):
+                return False  # the coverage map disagrees: some query runs its body
+            why.append(f"tpcds check: {rel}:{o.lineno} {o.name}() header only, never run by the queries")
+            return True
+        if [ast.dump(d) for d in o.decorator_list] != [ast.dump(d) for d in n.decorator_list]:
+            return False  # a called function's decorators decide what every call runs
+
+        def defaults(args):
+            pos = args.posonlyargs + args.args
+            d = {x.arg: ast.dump(v) for x, v in zip(pos[len(pos) - len(args.defaults):], args.defaults)}
+            d.update({x.arg: ast.dump(v) for x, v in zip(args.kwonlyargs, args.kw_defaults) if v is not None})
+            return d
+
+        do, dn = defaults(o.args), defaults(n.args)
+        changed = sorted(p for p in set(do) | set(dn) if do.get(p) != dn.get(p))
+        used = dm["used"].get(rel, {}).get(o.lineno, {})
+        if any(p in used for p in changed):
+            return False
+        why.append(f"tpcds check: {rel}:{o.lineno} {o.name}() defaults {changed} never used by the queries")
+        return True
+    except Exception as e:
+        log("tpcds header rule failed:", repr(e))
+        return False
+
+
 def tpcds_skippable(sel, budget=0.0):
     """True only if every change can reach test_execute_tpcds only through what the proxy compares,
     and the proxy dump of the patched source is identical to the pristine one."""
@@ -3473,6 +3700,7 @@ def tpcds_skippable(sel, budget=0.0):
     why = sel.why
     exec_all, exec_set = False, 0
     fixture_text, fixture_only, code_seen = {}, set(), False
+    header_decided, compared = 0, 0  # v7.6: regions decided by the header rule / left to the compare pass
     for f in sel.files:
         rel = f["new"] or f["old"]
         if f["binary"] or not f["old"] or not f["new"] or f["old"] != f["new"]:
@@ -3527,7 +3755,32 @@ def tpcds_skippable(sel, budget=0.0):
             if oc is not None and nc is not None and all(x in oc for x in range(oa, ob + 1)) \
                     and all(x in nc for x in range(na, nb + 1)):
                 continue  # only comment / blank lines removed and added here
-            if not tpcds_region_ok(sel, rel, tree, oa, ob, why):
+            region_ok = tpcds_region_ok(sel, rel, tree, oa, ob, why)
+            compared += region_ok
+            if not region_ok:
+                if tpcds_header_unaffected(sel, rel, tree, oa, ob, na, nb, why):
+                    header_decided += 1
+                    continue
+                fo = tpcds_insert_func(sel, rel, tree, oa, ob, na, nb)
+                xcr = (sel.idx.get("tpcds_xcov") or {}).get(rel)
+                if fo is not None and _inserted_noop(sel, rel, fo, na, nb):
+                    why.append(f"tpcds check: {rel}:{na} no-op statement inserted in {fo.name}()")
+                    header_decided += 1
+                    continue
+                if fo is not None and xcr is not None:
+                    mask = 0
+                    for x in range(first_line(fo.body[0]), fo.end_lineno + 1):
+                        mask |= xcr.get(x, 0)
+                    dmc = (sel.idx.get("tpcds_dflt") or {}).get("called", {}).get(rel, {})
+                    if not mask and fo.lineno not in dmc:
+                        why.append(f"tpcds check: {rel}:{na} insertion in {fo.name}(), which the queries never run")
+                        header_decided += 1
+                        continue
+                    exec_all = True
+                    if exec_set is not None:
+                        exec_set |= mask
+                    why.append(f"tpcds check: {rel}:{na} insertion in {fo.name}() body (call-time)")
+                    continue
                 # the change can reach code the test runs outside the compared calls: prove it by
                 # executing the queries for real (all of them, or those whose pipeline runs it)
                 exec_all = True
@@ -3545,7 +3798,15 @@ def tpcds_skippable(sel, budget=0.0):
                 elif exec_set is not None:
                     for x in lines:
                         exec_set |= xc.get(rel, {}).get(x, 0)
+    if header_decided and not compared and not exec_all and not fixture_text:
+        # every code edit is a def header the queries never depend on: nothing left to compare
+        why.append("tpcds check: only def headers the queries never depend on, no run needed")
+        return True
     # a patch can make the optimizer very slow: cap the check's wall clock (a timeout keeps the test)
+    if exec_all and os.environ.get("BR_TPCDS_NOEXEC") == "1":
+        why.append(f"tpcds check: execution proof off (BR_TPCDS_NOEXEC=1, eval only): would execute "
+                   f"{'all' if exec_set is None else bin(exec_set).count('1')} queries")
+        return False
     if exec_all:
         qs = None if exec_set is None else [i for i in range(exec_set.bit_length()) if exec_set >> i & 1]
         est = sum(v for k, v in sel.idx["tpcds_ref"]["sec"].items() if qs is None or int(k) in qs)
@@ -3798,7 +4059,7 @@ class Zygote:
     def __init__(self, test_files):
         import subprocess
         mods = [f[:-3].replace("/", ".") for f in test_files if f not in VERIFY_HEAVY]
-        self.p = subprocess.Popen([sys.executable, "-I", "-c", ZYGOTE, str(SRC), json.dumps(mods)],
+        self.p = subprocess.Popen([sys.executable, "-I", "-B", "-c", ZYGOTE, str(SRC), json.dumps(mods)],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                   text=True, cwd=str(SRC),
                                   env={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "SKIP_INTEGRATION": "0",
