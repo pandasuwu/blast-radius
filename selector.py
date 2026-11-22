@@ -3774,7 +3774,7 @@ VERIFY_HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")  # third-pa
 VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET", "140"))  # wall clock since start
 # Off by default: on the practice board v5.7 verified 1 commit clean (-2.0 s simulated) for +2.4 s CPU
 # (zygote 0.6 s, ~0.4 s per check; only ~13-20% of checks end in "all pass"). BR_VERIFY=1 turns it on.
-VERIFY_ON = os.environ.get("BR_VERIFY", "1") == "1"
+VERIFY_ON = os.environ.get("BR_VERIFY", "0") == "1"  # v7.2-noverify: off by default (BR_VERIFY=1 on)
 
 
 class Zygote:
