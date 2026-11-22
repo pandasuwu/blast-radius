@@ -3295,6 +3295,81 @@ def tpcds_run(overlay, ref=None, budget=0.0, timeout=240, limit=1e9, exec_all=Fa
         return {"ok": False, "why": repr(e)}, None
 
 
+# PROBE M (measurement only): what the execute-all import-time executor edit is.
+PM_FILES = {"sqlglot/executor/context.py": 1, "sqlglot/executor/table.py": 2, "sqlglot/executor/__init__.py": 3}
+_PM_DEFS = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _pm_find(tree, path):
+    body, node = tree.body, None
+    for name in path:
+        node = next((x for x in body if isinstance(x, _PM_DEFS) and x.name == name), None)
+        if node is None:
+            return None
+        body = node.body
+    return node
+
+
+def _pm_classify(sel, rel, tree, oa, ob, na, nb, lo, hi):
+    """(kind, file, r, v): kind 1 default, 2 decorator, 3 class-level assignment, 4 other def header,
+    5 other class-body statement, 6 other; r 0 TPC-DS never runs it / reads it, 1 runs the function
+    but never uses that default (attr: not profiled), 2 runs / reads it or unknown; v = 1 + line // 4."""
+    newt = ast.parse(sel.patched[rel])
+    if ob < oa:  # pure insertion: classify where it lands in the new file
+        t, a, b, line = newt, max(na, 1), max(nb, na, 1), na
+    else:
+        t, a, b, line = tree, lo, hi, lo
+    chain = _stmt_chain(t, a, b)
+    st = chain[-1] if chain else None
+    parent = chain[-2] if len(chain) > 1 else None
+    kind, r = 6, 2
+    dump = ast.dump
+    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        path = [x.name for x in chain if isinstance(x, _PM_DEFS)]
+        old = _pm_find(tree, path)
+        new = _pm_find(newt, path)
+        if old is None or new is None:
+            kind = 4
+        elif [dump(d) for d in old.decorator_list] != [dump(d) for d in new.decorator_list]:
+            kind = 2
+        else:
+            od = list(old.args.defaults) + list(old.args.kw_defaults)
+            nd = list(new.args.defaults) + list(new.args.kw_defaults)
+            kind = 1 if [dump(d) if d else None for d in od] != [dump(d) if d else None for d in nd] else 4
+        if old is not None:
+            xc = (sel.idx.get("tpcds_xcov") or {}).get(rel, {})
+            runs = any(xc.get(x, 0) for x in range(first_line(old.body[0]), old.end_lineno + 1))
+            if not runs:
+                r = 0
+            elif kind == 1 and new is not None:
+                tb = sel.idx["tests"].index(TPCDS_ID)
+                used, known = False, True
+                for d, e in zip(od, nd):
+                    if d is None or e is None or dump(d) == dump(e):
+                        continue
+                    pe = sel.idx["prof"].get(rel, {}).get((d.lineno, d.col_offset, d.end_lineno, d.end_col_offset))
+                    if pe is None or pe[0] != "dflt":
+                        known = False
+                    elif any(m >> tb & 1 for _sig, m in pe[3]):
+                        used = True
+                r = 1 if known and not used else 2
+    elif isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and isinstance(parent, ast.ClassDef):
+        kind = 3
+        names = [x.id for x in (st.targets if isinstance(st, ast.Assign) else [st.target]) if isinstance(x, ast.Name)]
+        tb = sel.idx["tests"].index(TPCDS_ID)
+        if not names or any(n not in sel.idx.get("attr_instr", ()) for n in names):
+            r = 1
+        else:
+            r = 2 if any(m >> tb & 1 for n in names for (_rel, _l, _imp, sigs) in sel.idx["attrprof"].get(n, ())
+                         for _sig, m in sigs) else 0
+    elif isinstance(st, ast.ClassDef) or isinstance(parent, ast.ClassDef):
+        kind, r = 5, 1
+    else:
+        r = 1
+    fcode = PM_FILES.get(rel, 4)
+    return kind, fcode, r, min(40, 1 + max(line, 0) // 4)
+
+
 def _stmt_chain(tree, lo, hi):
     """Statements (outermost first) whose span contains lines lo..hi."""
     chain, body = [], tree.body
@@ -3542,12 +3617,19 @@ def tpcds_skippable(sel, budget=0.0):
                 xc = sel.idx.get("tpcds_xcov")
                 if xc is None or lines & il or not any(isinstance(s, FUNC_TYPES) for s in chain):
                     exec_set = None  # import-time change, or no map: execute every query
+                    if lines & il and getattr(sel, "pm", None) is None and rel.startswith("sqlglot/executor/")                             and rel not in ("sqlglot/executor/python.py", "sqlglot/executor/env.py"):
+                        try:
+                            sel.pm = _pm_classify(sel, rel, tree, oa, ob, na, nb, lo, hi)
+                        except Exception as e:
+                            log("PROBE M classify failed:", repr(e))
                 elif exec_set is not None:
                     for x in lines:
                         exec_set |= xc.get(rel, {}).get(x, 0)
     # a patch can make the optimizer very slow: cap the check's wall clock (a timeout keeps the test)
     if exec_all:
         qs = None if exec_set is None else [i for i in range(exec_set.bit_length()) if exec_set >> i & 1]
+        if qs is None and getattr(sel, "pm", None) is not None:
+            sel.pm_fire = True  # PROBE M: mark whatever the proof decides
         est = sum(v for k, v in sel.idx["tpcds_ref"]["sec"].items() if qs is None or int(k) in qs)
         # pay at most the saving minus the comparison pass and a 2 s net gain
         # break-even: the parse pass (~2.5 s) plus execution must stay under the test's own time
@@ -3948,6 +4030,8 @@ def main():
     zyg = None
     out = []
     for patch in patches:
+        if sel is not None:  # PROBE M: per-commit markers
+            sel.pm, sel.pm_fire = None, False
         chosen = everything
         tiers = []
         if sel is not None:
@@ -4005,6 +4089,23 @@ def main():
         except Exception as e:
             log(patch.stem, "free riders failed:", repr(e))
             workers = pack(chosen, durations)
+        if sel is not None and getattr(sel, "pm_fire", False) and sel.pm is not None:
+            try:
+                # PROBE M: sim +2 s x kind (+ v ms: line bucket), CPU +2.5 s x (file + 4 r)
+                kind, fcode, r, v = sel.pm
+                workers = [w for w in workers if w]
+                used = {n for w in workers for n in w}
+                free = [n for n in range(len(durations)) if n not in used]
+                lt = min(free, key=lambda n: (abs(durations[n] - v), n))
+                zero = sorted((n for n in free if n != lt), key=lambda n: (durations[n], n))
+                marks = [[lt]] + [[n] for n in zero[:kind - 1]]
+                workers += marks[:max(0, MAX_WORKERS - len(workers))]
+                t_busy = time.process_time()
+                while time.process_time() - t_busy < 2.5 * (fcode + 4 * r):
+                    pass
+                log(patch.stem, "PROBE M:", kind, fcode, r, v, "line test ms", durations[lt])
+            except Exception as ex:
+                log(patch.stem, "PROBE M failed:", repr(ex))
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     if zyg is not None:
         zyg.close()
