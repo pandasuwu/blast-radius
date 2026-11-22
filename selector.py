@@ -38,6 +38,7 @@ MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 MAX_DEPTH = 4
 CHECK_FULL = os.environ.get("BR_FULLPARSE") == "1"
+PROBE_L = [0]  # PROBE L marker flag, set in select(), cleared per commit in main()
 IMPORT_CHECK = r"""
 import contextlib, importlib, importlib.util, importlib._bootstrap_external as be, io, json, os, sys
 d = json.load(sys.stdin)
@@ -2746,6 +2747,11 @@ class Selector:
                 for fb in self.pending_state:
                     mask |= fb
             else:
+                fb_all = 0
+                for fb in self.pending_state:
+                    fb_all |= fb
+                if fb_all & ~readers:
+                    PROBE_L[0] = 1  # PROBE L: the state diff dropped tests on this commit
                 mask |= readers
         if self.pending_imports:
             failed = self.check_imports()
@@ -3990,6 +3996,13 @@ def main():
         except Exception as e:
             log(patch.stem, "free riders failed:", repr(e))
             workers = pack(chosen, durations)
+        if PROBE_L[0]:
+            # PROBE L (measurement only): CPU +5 s per commit where the state diff dropped tests
+            PROBE_L[0] = 0
+            t_busy = time.process_time()
+            while time.process_time() - t_busy < 5.0:
+                pass
+            log(patch.stem, "PROBE L")
         out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     if zyg is not None:
         zyg.close()
