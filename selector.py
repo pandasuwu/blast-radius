@@ -3112,11 +3112,16 @@ def verdict(**k):
 REF, BUDGET, LIMIT = globals().get("REF"), globals().get("BUDGET", 0.0), globals().get("LIMIT", 1e9)
 EXEC_ALL = globals().get("EXEC_ALL", False)  # the patch changes code the execution itself runs
 EXEC_SET = globals().get("EXEC_SET")  # with EXEC_ALL: only these queries run changed code (None: all)
+ONLY = globals().get("ONLY")  # only the patched fixture changed: just these queries can differ
+if ONLY is not None:
+    ONLY = set(ONLY)
 if EXEC_SET is not None:
     EXEC_SET = set(EXEC_SET)
 sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
 parts, todo, est, tables = [], [], 0.0, {}
 for i, (meta, sql, _) in enumerate(sqls):
+    if REF is not None and ONLY is not None and i not in ONLY:
+        continue
     if REF is not None and time.process_time() - t0 > LIMIT:
         verdict(ok=False, why=f"query {i}: CPU limit reached (slow patch?)")
     e = pickle.loads(pickle.dumps(parse_one(sql)))
@@ -3218,14 +3223,26 @@ def _get_data(self, path):
             raise OSError("bytecode of a patched file: compile from source")
     return ov[rp] if rp in ov else _orig(self, path)
 be.FileLoader.get_data = _get_data
+import builtins, io
+_open = builtins.open
+_text_ov = {k: v.decode("utf-8") for k, v in ov.items() if not k.endswith(".py")}
+def _ov_open(file, mode="r", *a, **k):
+    # patched data files (tpc-ds.sql) are read through open(): serve the patched text
+    if _text_ov and isinstance(file, (str, os.PathLike)) and set(mode) <= set("rt"):
+        rp = os.path.realpath(file)
+        if rp in _text_ov:
+            return io.StringIO(_text_ov[rp])
+    return _open(file, mode, *a, **k)
+builtins.open = _ov_open
 sys.path.insert(0, d["src"])
 sys.argv = ["tpcds_check"]
 exec(compile(d["code"], "tpcds_check", "exec"), {"__name__": "__main__", "REF": d.get("ref"),
                                                   "BUDGET": d.get("budget", 0.0), "LIMIT": d.get("limit", 1e9),
                                                   "EXEC_ALL": d.get("exec_all", False),
-                                                  "EXEC_SET": d.get("exec_set")})
+                                                  "EXEC_SET": d.get("exec_set"), "ONLY": d.get("only")})
 """
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_CHECK_FIXTURE = os.environ.get("BR_TPCDS_FIXTURE", "1") == "1"  # v7.1: check tpc-ds.sql query edits
 TPCDS_MIN_SAVING_MS = 6000  # the check costs about 2-3 s of charged CPU before any execution
 TPCDS_MARGIN_S = 4.0  # CPU kept back from the saving for the comparison pass itself
 TPCDS_EXEC_CAP_S = 8.0  # most CPU spent executing changed queries for one commit
@@ -3241,7 +3258,7 @@ def plan_cost(workers, durations):
     return max(sum(durations[n] for n in w) for w in ws) + WORKER_COST_MS * len(ws) if ws else 0
 
 
-def tpcds_run(overlay, ref=None, budget=0.0, timeout=240, limit=1e9, exec_all=False, exec_set=None):
+def tpcds_run(overlay, ref=None, budget=0.0, timeout=240, limit=1e9, exec_all=False, exec_set=None, only=None):
     """Run TPCDS_CHECK with `overlay` swapped in. Returns (verdict dict, ref dict or None);
     the verdict is {"ok": False} whenever anything goes wrong."""
     import subprocess
@@ -3249,7 +3266,7 @@ def tpcds_run(overlay, ref=None, budget=0.0, timeout=240, limit=1e9, exec_all=Fa
         p = subprocess.run([sys.executable, "-I", "-B", "-c", TPCDS_RUN], cwd=str(SRC),
                            input=json.dumps({"src": str(SRC), "overlay": overlay, "code": TPCDS_CHECK,
                                              "ref": ref, "budget": budget, "limit": limit,
-                                             "exec_all": exec_all, "exec_set": exec_set}),
+                                             "exec_all": exec_all, "exec_set": exec_set, "only": only}),
                            capture_output=True, text=True, timeout=timeout,
                            env={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "PATH": os.environ.get("PATH", "")})
         lines = p.stderr.splitlines()
@@ -3440,6 +3457,7 @@ def tpcds_skippable(sel, budget=0.0):
         return False
     why = sel.why
     exec_all, exec_set = False, 0
+    fixture_text, fixture_only, code_seen = {}, set(), False
     for f in sel.files:
         rel = f["new"] or f["old"]
         if f["binary"] or not f["old"] or not f["new"] or f["old"] != f["new"]:
@@ -3454,6 +3472,14 @@ def tpcds_skippable(sel, budget=0.0):
                     if _tpcds_pairs_used(old) == _tpcds_pairs_used(new):
                         why.append("tpc-ds.sql: only expected outputs changed (test_execute_tpcds reads meta + sql)")
                         continue
+                    po, pn = _tpcds_pairs_used(old), _tpcds_pairs_used(new)
+                    if TPCDS_CHECK_FIXTURE and len(po) == len(pn):
+                        # queries changed: the check reads the patched file and decides each changed
+                        # query as the test does (parse, pickle; executed ones against duckdb on the new SQL)
+                        fixture_text[str(SRC / rel)] = new
+                        fixture_only.update(k for k, (a, b) in enumerate(zip(po, pn)) if a != b)
+                        why.append(f"tpc-ds.sql: queries {sorted(fixture_only)[:5]} changed, checked against duckdb")
+                        continue
                 except Exception as e:
                     log("tpc-ds fixture compare failed:", repr(e))
             return False
@@ -3465,6 +3491,7 @@ def tpcds_skippable(sel, budget=0.0):
         if rel == ENV_FILE and rel in sel.patched and eu is not None and sel.read_src(rel) is not None:
             keys = env_lambda_keys(sel.read_src(rel), sel.patched[rel])
             if keys is not None:
+                code_seen = True
                 # only queries whose generated code calls those entries run the changed bodies
                 exec_all = True
                 if exec_set is not None:
@@ -3472,6 +3499,7 @@ def tpcds_skippable(sel, budget=0.0):
                         exec_set |= eu.get(k, 0)
                 why.append(f"tpcds check: ENV lambda bodies only ({', '.join(sorted(keys))})")
                 continue
+        code_seen = True  # code changes: every query is compared (or executed), not just the fixture's
         if not (rel.startswith("sqlglot/") and rel.endswith(".py")) or rel not in sel.patched:
             return False
         old = sel.read_src(rel)
@@ -3516,9 +3544,10 @@ def tpcds_skippable(sel, budget=0.0):
         why.append(f"tpcds check: execute {'all' if qs is None else len(qs)} queries")
     else:
         qs = None
-    v, _ = tpcds_run({str(SRC / rel): text for rel, text in sel.patched.items()}, sel.idx["tpcds_ref"],
+    v, _ = tpcds_run({**{str(SRC / rel): text for rel, text in sel.patched.items()}, **fixture_text}, sel.idx["tpcds_ref"],
                      budget, timeout=TPCDS_MARGIN_S + max(budget, 0) + TPCDS_SLACK_S,
-                     limit=TPCDS_MARGIN_S + max(budget, 0), exec_all=exec_all, exec_set=qs)
+                     limit=TPCDS_MARGIN_S + max(budget, 0), exec_all=exec_all, exec_set=qs,
+                     only=sorted(fixture_only) if fixture_only and not code_seen else None)
     why.append("tpcds check: " + (f"same rows, executed {v.get('executed')}" if v.get("ok") else v.get("why", "?"))
                + f" ({v.get('cpu')} s)")
     return bool(v.get("ok"))
