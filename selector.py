@@ -3023,6 +3023,11 @@ def digest(x):
 def load_table(name):
     """tests/test_executor.py TestExecutor.setUpClass for one TPC-DS table, then the pickle round
     trip it makes once as the pool's initargs."""
+    if USE_ROWS and name in CACHE["rows"]:
+        # v7.5: the CSV parse is stdlib code on pristine files: its rows come from the build-time
+        # cache (plain tuples, which the pool's pickle round trip copies anyway); only the Table,
+        # whose class may be patched, is built here
+        return pickle.loads(pickle.dumps(Table(columns=TPCDS_SCHEMA[name], rows=pickle.loads(CACHE["rows"][name]))))
     return pickle.loads(pickle.dumps(_load_table(name)))
 
 
@@ -3076,6 +3081,92 @@ def run(e, names, tables):
     return (result_digest(r), loose_digest(r)), time.process_time() - t, r
 
 
+def tree_dumps(o):
+    """v7.5: an exact copy of an optimized tree as bytes. Expr.__reduce__ goes through serde
+    dump/load, which the executor can tell apart (sqlglot/executor/python.py subquery handling);
+    this pickles every node's slots, so parents and shared nodes come back as they were.
+    None if the tree holds anything but nodes, plain data, enums and classes."""
+    import copyreg, enum, io
+    plain = (str, int, float, bool, type(None), list, dict, tuple, set, frozenset, bytes, type, enum.Enum)
+    bad = []
+    slots = {}
+
+    class _P(pickle.Pickler):
+        def reducer_override(self, x):
+            if isinstance(x, exp.Expr):
+                c = type(x)
+                if c not in slots:
+                    slots[c] = [s for k in c.__mro__ for s in getattr(k, "__slots__", ())]
+                st = {s: getattr(x, s) for s in slots[c] if hasattr(x, s)}
+                return copyreg.__newobj__, (c,), (getattr(x, "__dict__", None) or None, st)
+            if not isinstance(x, plain):
+                bad.append(type(x).__qualname__)
+            return NotImplemented
+
+    b = io.BytesIO()
+    _P(b, protocol=pickle.HIGHEST_PROTOCOL).dump(o)
+    return None if bad else b.getvalue()
+
+
+def full_digest(x):
+    """digest() including parent links and cached hashes"""
+    global SKIP
+    keep, SKIP = SKIP, frozenset()
+    try:
+        return digest(x)
+    finally:
+        SKIP = keep
+
+
+def global_nodes():
+    """ids of the nodes that sqlglot's modules and classes hold (a cached tree must share none)"""
+    out = set()
+
+    def scan(v, depth):
+        if isinstance(v, exp.Expr):
+            out.update(id(n) for n in v.walk())
+        elif depth < 3 and isinstance(v, (list, tuple, set, frozenset)):
+            for y in v:
+                scan(y, depth + 1)
+        elif depth < 3 and isinstance(v, dict):
+            for y in list(v.values()) + list(v.keys()):
+                scan(y, depth + 1)
+
+    for name, m in list(sys.modules.items()):
+        if name.startswith("sqlglot") and m is not None:
+            for v in list(vars(m).values()):
+                scan(v, 0)
+                if isinstance(v, type):
+                    for cv in list(vars(v).values()):
+                        scan(cv, 1)
+    return out
+
+
+_STA = []
+
+
+def run_cached(opt_blob, names, tables):
+    """run() for a patch confined to executor context/table/env, which nothing outside
+    sqlglot/executor/ imports: parse, optimize() and Plan() are pristine code on pristine input, so
+    the build-time copy of the optimized tree stands in for optimize(). The rest of execute() (also
+    pristine) is replayed step by step; ensure_tables and the executor run the patched code.
+    Skipped: execute()'s logger.debug(expression.sql(pretty=True)) (pristine, leaves the tree as it is)."""
+    from sqlglot.errors import ExecuteError
+    from sqlglot.executor.python import PythonExecutor
+    from sqlglot.executor.table import ensure_tables
+    from sqlglot.planner import Plan
+    t = time.process_time()
+    tabs = {n: tables[n] for n in names}
+    tables_ = ensure_tables(tabs, dialect=None)
+    if not _STA:
+        _STA.append(ensure_schema(TPCDS_SCHEMA, dialect=None).supported_table_args)
+    if tables_.supported_table_args and tables_.supported_table_args != _STA[0]:
+        raise ExecuteError("Tables must support the same table args as schema")
+    plan = Plan(pickle.loads(opt_blob))
+    r = pickle.loads(pickle.dumps(PythonExecutor(tables=tables_).execute(plan)))
+    return (result_digest(r), loose_digest(r)), time.process_time() - t, r
+
+
 _DUCK = []
 
 
@@ -3125,6 +3216,13 @@ def test_assert(duck_sql, table):
 def verdict(**k):
     k["cpu"] = round(time.process_time() - t0, 2)
     print("VERDICT " + json.dumps(k), file=sys.stderr)
+    if REF is not None:
+        # v7.5: nothing to clean up in a proof: skip the interpreter's teardown of the tables and
+        # trees (~1 s of CPU, more with the GC off)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        import os
+        os._exit(0)
     sys.exit(0)
 
 
@@ -3136,6 +3234,24 @@ if ONLY is not None:
     ONLY = set(ONLY)
 if EXEC_SET is not None:
     EXEC_SET = set(EXEC_SET)
+# v7.5 build-time cache of the TPC-DS table rows (written by the reference run, checked there to give
+# the reference rows). ROWS_CACHE is set by tpcds_run only when the overlay is sqlglot/*.py files.
+ROWS_CACHE, CACHE_OUT = globals().get("ROWS_CACHE"), globals().get("CACHE_OUT")
+CACHE = None
+if REF is not None and ROWS_CACHE:
+    try:
+        with open(ROWS_CACHE, "rb") as _fh:
+            CACHE = pickle.load(_fh)
+        if CACHE.get("res") != REF["res"]:
+            CACHE = None  # built with another reference
+    except Exception:
+        CACHE = None
+USE_ROWS = bool(CACHE)
+# OPT_CACHE (tpcds_run): only executor context/table/env are patched, so every optimized tree is pristine
+USE_OPT = bool(CACHE and globals().get("OPT_CACHE") and EXEC_ALL and ONLY is None and CACHE.get("opt"))
+if USE_OPT:
+    USE_OPT = all(str(i) in CACHE["opt"] for i, p in enumerate(REF["parts"])
+                  if p is not None and (EXEC_SET is None or i in EXEC_SET))
 sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
 parts, todo, est, tables = [], [], 0.0, {}
 # v7.3 early abort: project the whole proof's cost from the first queries' real speed and give up
@@ -3150,25 +3266,33 @@ for i, (meta, sql, _) in enumerate(sqls):
         continue
     if REF is not None and time.process_time() - t0 > LIMIT:
         verdict(ok=False, why=f"query {i}: CPU limit reached (slow patch?)")
-    e = pickle.loads(pickle.dumps(parse_one(sql)))
-    if not meta.get("execute"):
-        parts.append(None)  # the child returns None for it: parsing and pickling is all that matters
-        continue
-    names = sorted({t.name for t in find_tables(e)})
-    duck_sql = transpile(sql, write="duckdb")[0]
-    duck = hashlib.sha256(duck_sql.encode()).hexdigest()[:20]
-    blob = pickle.dumps(e)  # execute() gets the unpickled tree, before optimize() touches it
-    will_run = REF is not None and EXEC_ALL and (EXEC_SET is None or i in EXEC_SET)
-    # execute() optimizes again and its rows are compared: no need to compare the tree first
-    opt = None if will_run else digest(optimize(e, ensure_schema(TPCDS_SCHEMA), leave_tables_isolated=True,
-                                                dialect=None))
-    parts.append([names, duck, opt])
-    if REF is None:
-        todo.append((i, blob, names, duck_sql))
-        continue
-    ref = REF["parts"][i]
-    if ref is None:
-        verdict(ok=False, why=f"query {i}: not an executed query before")
+    if USE_OPT:
+        # only executor context/table/env are patched: parse, pickle, find_tables, transpile and
+        # optimize run pristine code on the pristine fixture and give exactly the reference's parts
+        ref = REF["parts"][i]
+        if ref is None or (EXEC_SET is not None and i not in EXEC_SET):
+            continue  # not executed, or (outside EXEC_SET) its tree equals the reference's
+        names, duck, duck_sql, blob, opt, will_run = ref[0], ref[1], None, None, None, True
+    else:
+        e = pickle.loads(pickle.dumps(parse_one(sql)))
+        if not meta.get("execute"):
+            parts.append(None)  # the child returns None for it: parsing and pickling is all that matters
+            continue
+        names = sorted({t.name for t in find_tables(e)})
+        duck_sql = transpile(sql, write="duckdb")[0]
+        duck = hashlib.sha256(duck_sql.encode()).hexdigest()[:20]
+        blob = pickle.dumps(e)  # execute() gets the unpickled tree, before optimize() touches it
+        will_run = REF is not None and EXEC_ALL and (EXEC_SET is None or i in EXEC_SET)
+        # execute() optimizes again and its rows are compared: no need to compare the tree first
+        opt = None if will_run else digest(optimize(e, ensure_schema(TPCDS_SCHEMA), leave_tables_isolated=True,
+                                                    dialect=None))
+        parts.append([names, duck, opt])
+        if REF is None:
+            todo.append((i, blob, names, duck_sql))
+            continue
+        ref = REF["parts"][i]
+        if ref is None:
+            verdict(ok=False, why=f"query {i}: not an executed query before")
     if duck != ref[1]:
         # the reference SQL changed: the test passes as before if duckdb still returns the same
         if not REF.get("dres"):
@@ -3193,7 +3317,10 @@ for i, (meta, sql, _) in enumerate(sqls):
                 est += time.process_time() - t1
         if est > BUDGET:
             verdict(ok=False, why=f"query {i}: loading its tables spent the budget")
-        (strict, loose), took, table = run(pickle.loads(blob), names, tables)
+        if USE_OPT:
+            (strict, loose), took, table = run_cached(CACHE["opt"][str(i)], names, tables)
+        else:
+            (strict, loose), took, table = run(pickle.loads(blob), names, tables)
         # a patch may make a query slower but still correct (an optimization switched off): charge
         # the real time to the budget instead of giving up on any single slow query
         est += max(0.0, took - REF["sec"][str(i)])
@@ -3218,6 +3345,8 @@ for i, (meta, sql, _) in enumerate(sqls):
             est += (0.0 if "pandas" in sys.modules else 1.2) + REF["dsec"][str(i)] + (0.5 if not _DUCK else 0.0)
             if est > BUDGET:
                 verdict(ok=False, why=f"query {i}: different rows (no budget for the exact check)")
+            if duck_sql is None:
+                duck_sql = transpile(sql, write="duckdb")[0]
             if not test_assert(duck_sql, table):
                 verdict(ok=False, why=f"query {i}: different rows")
         todo.append((i, blob, names))
@@ -3235,6 +3364,39 @@ if REF is None:
     except Exception as e:  # no duckdb: a changed reference SQL keeps the test, as before
         print("no duckdb reference:", repr(e), file=sys.stderr)
         dres, dsec = None, None
+    if CACHE_OUT:
+        # v7.5: rows of every table, kept only if tables built from them give the reference rows
+        try:
+            import os
+            crows = {n: pickle.dumps(tables[n].rows, protocol=pickle.HIGHEST_PROTOCOL) for n in tables}
+            CACHE, USE_ROWS = {"rows": crows}, True
+            ctabs = {n: load_table(n) for n in tables}
+            CACHE, USE_ROWS = None, False
+            same = all(run(pickle.loads(blob), names, ctabs)[0] == (res[str(i)], lres[str(i)])
+                       for i, blob, names, duck_sql in todo)
+            # optimized trees: kept per query only if the copy is exact (full graph digest), holds no
+            # node sqlglot's modules hold, its sql() leaves it as it is, and it gives the reference rows
+            copt, gl = {}, global_nodes()
+            for i, blob, names, duck_sql in todo:
+                o = optimize(pickle.loads(blob), ensure_schema(TPCDS_SCHEMA, dialect=None),
+                             leave_tables_isolated=True, dialect=None)
+                ob = tree_dumps(o)
+                if ob is None or any(id(n) in gl for n in o.walk()):
+                    continue
+                d0 = full_digest(o)
+                o.sql(pretty=True)
+                if full_digest(o) != d0 or full_digest(pickle.loads(ob)) != d0:
+                    continue
+                if same and run_cached(ob, names, ctabs)[0] == (res[str(i)], lres[str(i)]):
+                    copt[str(i)] = ob
+            if same:
+                tmp = CACHE_OUT + ".tmp"
+                with open(tmp, "wb") as fh:
+                    pickle.dump({"res": res, "rows": crows, "opt": copt}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(tmp, CACHE_OUT)
+            print(f"tpcds cache written: {same}, {len(copt)} of {len(todo)} trees", file=sys.stderr)
+        except Exception as e:
+            print("tpcds rows cache not written:", repr(e), file=sys.stderr)
     print("REF " + json.dumps({"parts": parts, "res": res, "lres": lres, "dres": dres, "dsec": dsec, "shape": shape,
                                "sec": {k: round(v, 3) for k, v in sec.items()}}), file=sys.stderr)
     verdict(ok=True, ref=True)
@@ -3270,10 +3432,35 @@ def _ov_open(file, mode="r", *a, **k):
 builtins.open = _ov_open
 sys.path.insert(0, d["src"])
 sys.argv = ["tpcds_check"]
+if d.get("ref") is not None and d.get("nogc"):
+    # v7.5: no cyclic GC in a proof (its tables hold millions of tracked objects: ~25% of the
+    # executor's CPU); it comes back on if the process grows past 1.2 GB. The reference run keeps
+    # the GC: its timings are the budget's unit.
+    import gc, threading, time as _time
+    gc.disable()
+    def _rss_watch():
+        try:
+            page = os.sysconf("SC_PAGE_SIZE")
+            while True:
+                _time.sleep(0.2)
+                fd = os.open("/proc/self/statm", os.O_RDONLY)
+                try:
+                    rss = int(os.read(fd, 200).split()[1]) * page
+                finally:
+                    os.close(fd)
+                if rss > 1200 * 2 ** 20:
+                    break
+        except Exception:
+            pass
+        gc.enable()
+        gc.collect()
+    threading.Thread(target=_rss_watch, daemon=True).start()
 exec(compile(d["code"], "tpcds_check", "exec"), {"__name__": "__main__", "REF": d.get("ref"),
                                                   "BUDGET": d.get("budget", 0.0), "LIMIT": d.get("limit", 1e9),
                                                   "EXEC_ALL": d.get("exec_all", False),
-                                                  "EXEC_SET": d.get("exec_set"), "ONLY": d.get("only")})
+                                                  "EXEC_SET": d.get("exec_set"), "ONLY": d.get("only"),
+                                                  "ROWS_CACHE": d.get("rows_cache"), "CACHE_OUT": d.get("cache_out"),
+                                                  "OPT_CACHE": d.get("opt_cache")})
 """
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_CHECK_FIXTURE = os.environ.get("BR_TPCDS_FIXTURE", "1") == "1"  # v7.1: check tpc-ds.sql query edits
@@ -3285,6 +3472,14 @@ TPCDS_EXEC_ALL_KEEP_S = 2.5  # saving kept back for the parse pass of an executi
 TPCDS_SLACK_S = 8.0  # wall-clock slack on top of margin + budget before a check is killed
 # wall clock; the run limit is 180 s (270 s in the final). Override only for big offline eval batches.
 TPCDS_BUDGET_S = float(os.environ.get("BR_TPCDS_BUDGET", "120"))
+# v7.5 proof CPU: build-time table-rows cache next to the index; no GC and no teardown in proofs
+TPCDS_CACHE = INDEX.with_name(INDEX.stem + ".tpcds.pkl")
+TPCDS_ROWS = os.environ.get("BR_TPCDS_ROWS", "1") == "1"
+TPCDS_NOGC = os.environ.get("BR_TPCDS_NOGC", "1") == "1"
+TPCDS_OPT = os.environ.get("BR_TPCDS_OPT", "1") == "1"
+# nothing outside sqlglot/executor/ imports these, and execute() reaches them only through
+# ensure_tables and the executor: with only these patched, every optimized tree is the pristine one
+TPCDS_OPT_SAFE = {"sqlglot/executor/context.py", "sqlglot/executor/table.py", "sqlglot/executor/env.py"}
 
 
 def plan_cost(workers, durations):
@@ -3296,11 +3491,28 @@ def tpcds_run(overlay, ref=None, budget=0.0, timeout=240, limit=1e9, exec_all=Fa
     """Run TPCDS_CHECK with `overlay` swapped in. Returns (verdict dict, ref dict or None);
     the verdict is {"ok": False} whenever anything goes wrong."""
     import subprocess
+    rows_cache = cache_out = None
+    opt_cache = False
+    if ref is None:
+        cache_out = str(TPCDS_CACHE)
+    elif TPCDS_ROWS and overlay and TPCDS_CACHE.exists():
+        # the CSV files, tests/helpers.py and the loader are pristine unless a non-sqlglot file is patched
+        rels = []
+        for k in overlay:
+            try:
+                rels.append(Path(k).relative_to(SRC).as_posix())
+            except ValueError:
+                rels.append("")
+        if all(r.startswith("sqlglot/") and r.endswith(".py") for r in rels):
+            rows_cache = str(TPCDS_CACHE)
+            opt_cache = TPCDS_OPT and all(r in TPCDS_OPT_SAFE for r in rels)
     try:
         p = subprocess.run([sys.executable, "-I", "-B", "-c", TPCDS_RUN], cwd=str(SRC),
                            input=json.dumps({"src": str(SRC), "overlay": overlay, "code": TPCDS_CHECK,
                                              "ref": ref, "budget": budget, "limit": limit,
-                                             "exec_all": exec_all, "exec_set": exec_set, "only": only}),
+                                             "exec_all": exec_all, "exec_set": exec_set, "only": only,
+                                             "rows_cache": rows_cache, "cache_out": cache_out, "opt_cache": opt_cache,
+                                             "nogc": TPCDS_NOGC}),
                            capture_output=True, text=True, timeout=timeout,
                            env={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "PATH": os.environ.get("PATH", "")})
         lines = p.stderr.splitlines()
