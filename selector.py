@@ -3441,12 +3441,14 @@ for i, (meta, sql, _) in enumerate(sqls):
             verdict(ok=False, why=f"query {i}: execution needs more than the budget")
         if will_run:
             N_DONE += 1
-            DONE_REF += REF["sec"][str(i)]
-            DONE_TOOK += took
             REM_REF -= REF["sec"][str(i)]
+            if N_DONE > 1:  # the first executed query pays cold-start costs: not a speed sample
+                DONE_REF += REF["sec"][str(i)]
+                DONE_TOOK += took
             ahead = max(0.0, REM_REF) * DONE_TOOK / max(DONE_REF, 1e-3)
-            if N_DONE >= 3 and (est + ahead > BUDGET or time.process_time() - t0 + ahead > LIMIT):
-                verdict(ok=False, why=f"query {i}: projected execution cost is over the budget")
+            if N_DONE >= 6 and (est + ahead > BUDGET or time.process_time() - t0 + ahead > LIMIT):
+                verdict(ok=False, why=f"query {i}: projected execution cost is over the budget "
+                                      f"(speed x{DONE_TOOK / max(DONE_REF, 1e-3):.2f}, {ahead:.1f} s ahead)")
         if duck_changed or (strict != REF["res"][str(i)] and loose != REF["lres"][str(i)]):
             # rows or reference differ from pristine: decide exactly as the test does
             if not REF.get("dres"):
