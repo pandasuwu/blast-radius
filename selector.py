@@ -3769,7 +3769,7 @@ for line in sys.stdin:
     os.waitpid(pid, 0)
     print("VERIFY " + (data.decode() or json.dumps({"ok": False, "bad": ["child died"]})), flush=True)
 """
-VERIFY_MAX_COST_MS = 6000  # only selections this cheap are worth verifying (~2 s saved when all pass)
+VERIFY_MAX_COST_MS = int(os.environ.get("BR_VERIFY_MAX_MS", "6000"))  # only selections this cheap are worth verifying (~2 s saved when all pass)
 VERIFY_HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")  # third-party deps, shared pools
 VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET", "140"))  # wall clock since start
 # Off by default: on the practice board v5.7 verified 1 commit clean (-2.0 s simulated) for +2.4 s CPU
@@ -3983,6 +3983,9 @@ def main():
             except Exception as e:
                 log(patch.stem, "error, everything:", repr(e))
         try:
+            if os.environ.get("BR_DUMP_CORE"):
+                with open(os.environ["BR_DUMP_CORE"], "a") as fh:
+                    print(json.dumps({"commit": patch.stem, "core": sorted(chosen)}), file=fh)
             workers = pack_free(chosen, tiers, durations)
         except Exception as e:
             log(patch.stem, "free riders failed:", repr(e))
