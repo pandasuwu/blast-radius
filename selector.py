@@ -637,6 +637,214 @@ def class_attr_names(tree):
 # ----------------------------------------------------------------------------- index build
 
 
+FWD_TOKENS = "sqlglot/tokens.py"
+FWD_CORE = "sqlglot/tokenizer_core.py"
+FWD_COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match) + \
+    ((ast.TryStar,) if hasattr(ast, "TryStar") else ())
+
+
+def _fwd_parents(tree):
+    parents = {}
+    for p in ast.walk(tree):
+        for c in ast.iter_child_nodes(p):
+            parents[id(c)] = p
+    return parents
+
+
+def _fwd_span(node, parents):
+    """Lines whose coverage says `node` was evaluated: its whole statement, or for a compound
+    statement only the header (from the statement's first line to the end of the expression)."""
+    s = node
+    while s is not None and not isinstance(s, ast.stmt):
+        s = parents.get(id(s))
+    if s is None:
+        return None
+    if isinstance(s, FWD_COMPOUND):
+        return min(s.lineno, node.lineno), node.end_lineno
+    return s.lineno, s.end_lineno
+
+
+def _fwd_truth_only(node, parents):
+    """True when the value of `node` is only tested for truth (an if/while/ternary/assert/comprehension
+    condition, possibly through and/or/not): a change that keeps bool(value) cannot be seen there."""
+    x, p = node, parents.get(id(node))
+    while (isinstance(p, ast.BoolOp) and any(v is x for v in p.values)) or \
+            (isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not)):
+        x, p = p, parents.get(id(p))
+    if isinstance(p, (ast.If, ast.While, ast.IfExp, ast.Assert)) and p.test is x:
+        return True
+    return isinstance(p, ast.comprehension) and any(c is x for c in p.ifs)
+
+
+def _fwd_persists(node, parents):
+    """The value (or something computed from it) may be kept beyond the running frame."""
+    s = node
+    while s is not None and not isinstance(s, ast.stmt):
+        if isinstance(s, (ast.Lambda, ast.NamedExpr, ast.Yield, ast.YieldFrom, ast.Await)):
+            return True
+        s = parents.get(id(s))
+    if isinstance(s, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+        targets = s.targets if isinstance(s, ast.Assign) else [s.target]
+        return not all(isinstance(t, ast.Name) for t in targets)
+    return isinstance(s, (ast.Global, ast.Nonlocal))
+
+
+def _fwd_mentions(tree, A, call):
+    for y in ast.walk(tree):
+        if isinstance(y, ast.Attribute) and y.attr == A:
+            return True
+        if isinstance(y, ast.Constant) and isinstance(y.value, str) and re.search(r"\b%s\b" % re.escape(A), y.value):
+            return True
+        if isinstance(y, ast.keyword) and y.arg == A and not any(y is k for k in call.keywords):
+            return True
+        if isinstance(y, (ast.Global, ast.Nonlocal)) and A in y.names:
+            return True
+    return False
+
+
+def build_fwd_settings(idx, trees):
+    """v7.3: Tokenizer settings forwarded into TokenizerCore(...).
+
+    Tokenizer._init_core passes class settings (self.X, self.dialect.Y) as keyword arguments; the
+    core's __init__ stores each as self.A and reads self.A (or a local copied from it) later. So the
+    forwarding read in tokens.py only matters to tests that ran one of those core read lines.
+    Result: {(X, line of the read in tokens.py): {"kw", "attr", "value": mask, "truth": mask}};
+    "value" = tests that ran a line using the value, "truth" = tests that ran a bare truth test
+    of it. A setting is left out (old behaviour) whenever any step is not plain."""
+    out = {}
+    if FWD_TOKENS not in trees or FWD_CORE not in trees or not idx["lines"].get(FWD_CORE):
+        return out  # no core source, or a compiled core (no line coverage)
+    lines = idx["lines"][FWD_CORE]
+
+    def cover(a, b):
+        mm = 0
+        for ln in range(a, b + 1):
+            mm |= lines.get(ln, 0)
+        return mm
+
+    ttree, _ = trees[FWD_TOKENS]
+    ctree, _ = trees[FWD_CORE]
+    cparents = _fwd_parents(ctree)
+    tok = [n for n in ttree.body if isinstance(n, ast.ClassDef) and n.name == "Tokenizer"]
+    core = [n for n in ctree.body if isinstance(n, ast.ClassDef) and n.name == "TokenizerCore"]
+    if len(tok) != 1 or len(core) != 1:
+        return out
+    tok, core = tok[0], core[0]
+    calls = [c for c in ast.walk(ttree) if isinstance(c, ast.Call) and chain(c.func) == ["TokenizerCore"]]
+    if len(calls) != 1 or calls[0].args or any(k.arg is None for k in calls[0].keywords):
+        return out
+    call = calls[0]
+    if not (tok.lineno <= call.lineno <= tok.end_lineno):
+        return out
+    if any(isinstance(n, FUNC_TYPES) and n.name in ("__setattr__", "__getattr__", "__getattribute__", "__delattr__")
+           for n in core.body) or core.bases or core.keywords or core.decorator_list:
+        return out
+    if any(isinstance(n, ast.ClassDef) and any((chain(b) or [""])[-1] == "TokenizerCore" for b in n.bases)
+           for t, _ in trees.values() for n in ast.walk(t)):
+        return out  # a subclass could read the attributes elsewhere
+    init = [n for n in core.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"]
+    if len(init) != 1:
+        return out
+    init = init[0]
+    if init.args.vararg or init.args.kwarg:
+        return out
+    params = {a.arg for a in init.args.posonlyargs + init.args.args + init.args.kwonlyargs}
+    # how often each identifier occurs in each source (comments and strings included)
+    word = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+    counts = {}
+    for rel, (_t, text) in trees.items():
+        cnt = {}
+        for w in word.findall(text):
+            cnt[w] = cnt.get(w, 0) + 1
+        counts[rel] = cnt
+    for k in call.keywords:
+        c = chain(k.value)
+        if not (c and c[0] == "self" and (len(c) == 2 or (len(c) == 3 and c[1] == "dialect"))):
+            continue  # derived (bool(self.X), ...): old behaviour
+        X, line = c[-1], k.value.lineno
+        # X is read nowhere else in tokens.py: only stores (class bodies, the metaclass) besides this read
+        other = [y for y in ast.walk(ttree) if (isinstance(y, ast.Attribute) and y.attr == X and y is not k.value
+                                                and not isinstance(y.ctx, ast.Store))
+                 or (isinstance(y, ast.Name) and y.id == X and not isinstance(y.ctx, ast.Store))
+                 or (isinstance(y, ast.Constant) and y.value == X)]
+        if other or k.value.end_lineno != line or k.arg not in params:
+            continue
+        uses = [y for y in ast.walk(init) if isinstance(y, ast.Name) and y.id == k.arg]
+        if len(uses) != 1 or not isinstance(uses[0].ctx, ast.Load):
+            continue
+        st = cparents.get(id(uses[0]))
+        tc = chain(st.targets[0]) if isinstance(st, ast.Assign) and len(st.targets) == 1 else None
+        if not (st.value is uses[0] and tc and len(tc) == 2 and tc[0] == "self" and cparents.get(id(st)) is init):
+            continue
+        A = tc[1]
+        if A != k.arg:
+            continue  # parameter and attribute named differently: the word counts below assume one name
+        # every occurrence of A in the core file is known: the store, self.A loads inside
+        # TokenizerCore, the parameter and its one use, the __slots__ string
+        loads, ok = [], True
+        for y in ast.walk(ctree):
+            if isinstance(y, ast.Attribute) and y.attr == A:
+                if y is st.targets[0]:
+                    continue
+                if not (isinstance(y.ctx, ast.Load) and isinstance(y.value, ast.Name) and y.value.id == "self"
+                        and core.lineno <= y.lineno <= core.end_lineno):
+                    ok = False
+                    break
+                loads.append(y)
+        if not ok:
+            continue
+        params_n = sum(1 for y in ast.walk(ctree) if isinstance(y, ast.arg) and y.arg == A)
+        names_n = sum(1 for y in ast.walk(ctree) if isinstance(y, ast.Name) and y.id == A)
+        # strings that mention A: only the __slots__ entry and docstrings (no getattr(self, "A"))
+        docs = {id(b[0].value) for b in (getattr(x, "body", None) for x in ast.walk(ctree))
+                if isinstance(b, list) and b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant)}
+        slots = [y for y in ast.walk(core) if isinstance(y, ast.Constant) and y.value == A]
+        strs = [y for y in ast.walk(ctree) if isinstance(y, ast.Constant) and isinstance(y.value, str)
+                and re.search(r"\b%s\b" % re.escape(A), y.value) and id(y) not in docs]
+        keywords_n = sum(1 for y in ast.walk(ctree) if isinstance(y, ast.keyword) and y.arg == A)
+        # locals named A elsewhere in the core are only allowed as copies of self.A (checked below)
+        if len(slots) > 1 or len(strs) != len(slots) or params_n != 1 or keywords_n or \
+                any(isinstance(y, (ast.Global, ast.Nonlocal)) and A in y.names for y in ast.walk(ctree)):
+            continue
+        # elsewhere (sqlglot/, tests/) nothing can reach core.A: no attribute A, no string "A" (getattr),
+        # no keyword A except in the one TokenizerCore(...) call (a plain local named A is harmless)
+        if any(_fwd_mentions(t, A, call) for rel, (t, _x) in trees.items() if rel != FWD_CORE and counts[rel].get(A)):
+            continue
+        value = truth = 0
+        local_uses = 0
+        for y in loads:
+            p = cparents.get(id(y))
+            targets = [y]
+            if isinstance(p, ast.Assign) and p.value is y and len(p.targets) == 1 and isinstance(p.targets[0], ast.Name):
+                lu = Selector._local_uses(p, cparents)
+                if lu is None:
+                    sp = _fwd_span(y, cparents)
+                    if sp is None:
+                        ok = False
+                        break
+                    value |= cover(*sp)  # the copy line runs whenever any of its uses can
+                    continue
+                targets = lu
+                if p.targets[0].id == A:
+                    local_uses += 1 + len(lu)
+            for u in targets:
+                sp = _fwd_span(u, cparents)
+                if sp is None or _fwd_persists(u, cparents):
+                    ok = False
+                    break
+                if _fwd_truth_only(u, cparents):
+                    truth |= cover(*sp)
+                else:
+                    value |= cover(*sp)
+            if not ok:
+                break
+        # every Name A in the core file is the parameter use in __init__ or a followed local copy
+        if not ok or names_n != 1 + local_uses:
+            continue
+        out[(X, line)] = {"kw": k.arg, "attr": A, "value": value, "truth": truth, "dialect": len(c) == 3}
+    return out
+
+
 def build_index():
     m = json.load(gzip.open(MAPS, "rt"))
     sets = [int(x, 16) for x in m["sets"]]
@@ -885,6 +1093,12 @@ def build_index():
     idx.update(units=units, refs=refs, classinfo=classinfo, modules=modules, walkers=walkers,
                core=core, rdeps=rdeps, importsens=importsens, mod_refmask=mod_refmask,
                attrnames=attrnames, toplevel=toplevel)
+    try:
+        idx["fwd"] = build_fwd_settings(idx, trees)
+    except Exception as e:
+        log("forwarded tokenizer settings off:", repr(e))
+        idx["fwd"] = {}
+    log("forwarded tokenizer settings:", len(idx["fwd"]))
     try:
         idx["pool_groups"] = shared_pool_groups(m["tests"])
     except Exception as e:
@@ -1557,7 +1771,10 @@ class Selector:
     def class_attr(self, ck, name, depth=0, added=False):
         """Tests that can observe a change of attribute `name` of class `ck`."""
         flip = getattr(self, "flag_flip", None) == (ck, name)
-        key = ("ca", ck, name, added, flip)
+        # v7.3: a plain class-level assignment of a setting Tokenizer forwards into TokenizerCore
+        fwd_ctx = getattr(self, "fwd_change", None)
+        fwd_ctx = fwd_ctx[2] if fwd_ctx and fwd_ctx[:2] == (ck, name) and depth == 0 and not added else None
+        key = ("ca", ck, name, added, flip, fwd_ctx)
         if key in self.memo:
             return self.memo[key]
         self.memo[key] = 0
@@ -1621,6 +1838,14 @@ class Selector:
                     # no import-time read took ck's value: import-time evaluations downstream cannot see it
                     ck_at_import = any(k.partition("@")[0] in ("?", ck) for k in imp)
                     site &= self.flag_site(prel, pline, name, site, ignore_imp=not ck_at_import)
+                if fwd_ctx is not None and site and prel == FWD_TOKENS:
+                    fw = self.idx.get("fwd", {}).get((name, pline))
+                    if fw is not None:
+                        # forwarded as TokenizerCore(kw=...) and stored as core.A: only tests that ran a
+                        # core line reading A can see the new value (a bare truth test of A only when
+                        # the change can flip bool(value))
+                        site &= fw["value"] | (0 if fwd_ctx == "truth kept" else fw["truth"])
+                        self.why.append(f"tokenizer setting {name} -> core {fw['attr']} reads")
                 direct |= site
         for u, resolved, kind, *_pos in self.idx["refs"].get(name, ()):
             urel, a, b, ukind = self.idx["units"][u][:4]
@@ -2251,14 +2476,22 @@ class Selector:
             # a class flag flipped: a read that is an operand of a profiled and/or only matters
             # where that and/or's outcome changes with the operand flipped
             self.flag_flip = (ck, o.targets[0].id)
+            self.fwd_change = self.fwd_setting_change(o, n, ck)
             try:
                 return self.stmt(o, n, ck)
             finally:
-                self.flag_flip = None
+                self.flag_flip = self.fwd_change = None
         dv = self.dict_value_only(o, n)
         if dv is not None:
             self.why.append(f"dict values of {ck or self.mod}: {', '.join(defined_names(o))[:60]}")
             return dv | (self.idx["untrusted"] & self.cover(self.rel, first_line(o), o.end_lineno))
+        fc = self.fwd_setting_change(o, n, ck)
+        if fc is not None:
+            self.fwd_change = fc
+            try:
+                return self.stmt(o, n, ck)
+            finally:
+                self.fwd_change = None
         if isinstance(o, FUNC_TYPES) and isinstance(n, FUNC_TYPES) and self.overload_stub_only(o, n):
             # typing.overload returns a dummy and keeps the stub only for get_overloads(): its body
             # never runs, and its defaults are constants evaluated once at import
@@ -2293,6 +2526,32 @@ class Selector:
                 self.why.append(f"function {where}")
             return m
         return self.stmt(o, n, ck)
+
+    def fwd_setting_change(self, o, n, ck):
+        """v7.3: (ck, name, truth) when o -> n is a plain class-level assignment (same single Name
+        target, same annotation) of a name Tokenizer forwards into TokenizerCore; truth is
+        "truth kept" when both values are literals with the same bool(), else "may flip"."""
+        fwd = self.idx.get("fwd")
+        if not (ck and fwd) or type(o) is not type(n) or not isinstance(o, (ast.Assign, ast.AnnAssign)):
+            return None
+        if isinstance(o, ast.Assign):
+            if not (len(o.targets) == len(n.targets) == 1 and isinstance(o.targets[0], ast.Name)
+                    and isinstance(n.targets[0], ast.Name) and o.targets[0].id == n.targets[0].id):
+                return None
+            name = o.targets[0].id
+        else:
+            if not (isinstance(o.target, ast.Name) and isinstance(n.target, ast.Name) and o.target.id == n.target.id
+                    and o.simple and n.simple and dump(o.annotation) == dump(n.annotation)
+                    and o.value is not None and n.value is not None):
+                return None
+            name = o.target.id
+        if not any(X == name for X, _ in fwd):
+            return None
+        try:
+            kept = bool(ast.literal_eval(o.value)) == bool(ast.literal_eval(n.value))
+        except Exception:
+            kept = False
+        return ck, name, "truth kept" if kept else "may flip"
 
     def _tree_parents(self, rel):
         fk = ("flagtree", rel)
@@ -3652,13 +3911,21 @@ print("READY", flush=True)
 
 
 class Result(unittest.TestResult):
+    # runs every test (no stop at the first failure) and records each failing one
     def __init__(self):
         super().__init__()
         self.bad = None
+        self.failed = []  # unittest ids, first failure first
+        self.started = set()
+    def startTest(self, test):
+        super().startTest(test)
+        self.started.add(getattr(test, "id", lambda: str(test))())
     def _fail(self, test, kind):
+        tid = getattr(test, "id", lambda: str(test))()
         if self.bad is None:
-            self.bad = (getattr(test, "id", lambda: str(test))(), kind)
-        self.stop()
+            self.bad = (tid, kind)
+        if tid not in self.failed:
+            self.failed.append(tid)
     def addError(self, test, err): self._fail(test, "error")
     def addFailure(self, test, err): self._fail(test, "failure")
     def addUnexpectedSuccess(self, test): self._fail(test, "unexpected success")
@@ -3734,16 +4001,24 @@ def child(req):
                 return {"ok": False, "bad": ["swap", q]}
             f.__code__ = new
     suite = unittest.TestSuite()
+    uid = {}
     for tid in req["ids"]:
         path, cls, meth = tid.split("::")
         m = sys.modules.get(path[:-3].replace("/", "."))
         if m is None:
             return {"ok": False, "bad": ["not loaded", path]}
-        suite.addTest(getattr(m, cls)(meth))
+        t = getattr(m, cls)(meth)
+        uid[t.id()] = tid
+        suite.addTest(t)
     res = Result()
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         suite.run(res)
-    return {"ok": res.bad is None, "bad": res.bad, "ran": res.testsRun}
+    out = {"ok": res.bad is None, "bad": res.bad, "ran": res.testsRun}
+    if res.bad is not None and all(f in uid for f in res.failed):
+        # every failure belongs to one of the requested tests (not setUpClass/setUpModule): report
+        # them, plus the tests that never started, as the ones still to run
+        out["keep"] = [uid[f] for f in res.failed] + [t for u, t in uid.items() if u not in res.started]
+    return out
 
 
 for line in sys.stdin:
@@ -3772,8 +4047,10 @@ for line in sys.stdin:
 VERIFY_MAX_COST_MS = int(os.environ.get("BR_VERIFY_MAX_MS", "6000"))  # only selections this cheap are worth verifying (~2 s saved when all pass)
 VERIFY_HEAVY = ("tests/test_optimizer.py", "tests/test_executor.py")  # third-party deps, shared pools
 VERIFY_BUDGET_S = float(os.environ.get("BR_VERIFY_BUDGET", "140"))  # wall clock since start
-# Off by default: on the practice board v5.7 verified 1 commit clean (-2.0 s simulated) for +2.4 s CPU
-# (zygote 0.6 s, ~0.4 s per check; only ~13-20% of checks end in "all pass"). BR_VERIFY=1 turns it on.
+# On by default (BR_VERIFY=0 turns it off). History: v5.7 had it on; on the practice board it verified 1
+# commit clean (-2.0 s simulated) for +2.4 s CPU (zygote 0.6 s, ~0.4 s per check; only ~13-20% of checks
+# ended in "all pass"), so v5.7.1 turned it off; later versions turned it back on. Since v7.3 a check
+# that sees failures keeps only the failing tests (plus any that did not run).
 VERIFY_ON = os.environ.get("BR_VERIFY", "1") == "1"
 
 
@@ -3967,8 +4244,18 @@ def main():
                             ids = [tests[n]["id"] for n in sorted(chosen)]
                             v = zyg.check(changes, ids) if changes else zyg.check(None, ids, reload=plan[0],
                                                                                   overlay=plan[1])
-                            why.append("verify: " + ("all pass, nothing to run" if v.get("ok")
-                                                     else str(v.get("bad"))[:80]))
+                            keep = None if v.get("ok") else v.get("keep")
+                            if keep:
+                                keep = set(keep)
+                                kept = [n for n in chosen if tests[n]["id"] in keep]
+                                if kept and len(keep) == len(kept):
+                                    why.append(f"verify: {len(kept)} of {len(chosen)} fail, only those run")
+                                    chosen = kept
+                                else:
+                                    why.append("verify: " + str(v.get("bad"))[:80])
+                            else:
+                                why.append("verify: " + ("all pass, nothing to run" if v.get("ok")
+                                                         else str(v.get("bad"))[:80]))
                             if v.get("ok"):
                                 chosen = []
                     except Exception as e:

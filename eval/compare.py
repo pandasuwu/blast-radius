@@ -3,12 +3,15 @@
 usage: python eval/compare.py <cmp_dir> <tests.json> base other [other...]
 """
 import json
+import os
 import sys
 
 cmp_dir, tests_json, *vers = sys.argv[1:]
 tests = json.load(open(tests_json))["tests"]
 dur = [round(t["seconds"] * 1000) for t in tests]
 SETS = {"sample": "sample/answers.json", "mut": "work/mut/answers.json", "mut2": "work/mut2/answers.json", "mut3": "work/mut3/answers.json"}
+if os.environ.get("BR_SETS"):  # e.g. BR_SETS=sample,mutK -> sample/answers.json, work/mutK/answers.json
+    SETS = {n: "sample/answers.json" if n == "sample" else f"work/{n}/answers.json" for n in os.environ["BR_SETS"].split(",")}
 
 
 def load(ver, s):
